@@ -426,18 +426,32 @@ class SpatialMetricsVisualizer:
                 plt.colorbar(im, ax=ax, label='Distance to Obstacle (meters)')
             
             if 'max_passage_radius_m' in metric_results and metric_results['max_passage_radius_m'] > 0:
-                max_radius = metric_results['max_passage_radius_m']
-                
-                # BUG 2 FIXED: Automatically extract physical coordinates for the max passage circle
+                # Prefer computing the radius/location from the displayed distance_transform to
+                # guarantee unit consistency with the imshow'd raster (distance_transform_m).
                 max_idx = np.unravel_index(np.argmax(distance_transform), distance_transform.shape)
                 max_y = max_idx[0] * self.analyzer.meters_per_pixel
                 max_x = max_idx[1] * self.analyzer.meters_per_pixel
                 
-                circle = mpatches.Circle((max_x, max_y), max_radius, fill=False, edgecolor='#FF0000', linewidth=3)
-                ax.add_patch(circle)
-                ax.text(max_x, max_y - max_radius - 0.5, f'Max radius: {max_radius:.2f}m',
-                        ha='center', fontsize=12, color='#FF0000', fontweight='bold',
-                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                # Compute radius from the displayed map (meters). This avoids unit mismatch
+                # if the analyzer returned a pixel-valued radius by mistake.
+                max_radius_m = float(distance_transform_m.max())
+                
+                # If analyzer also provided a radius, log a small-warning overlay (visual check)
+                supplied = metric_results.get('max_passage_radius_m', None)
+                if supplied is not None:
+                    supplied = float(supplied)
+                    # If supplied value differs substantially, prefer the computed value but draw both lightly.
+                    if abs(supplied - max_radius_m) / (max_radius_m + 1e-9) > 0.2:
+                        # draw supplied as a thin dashed circle for debugging
+                        debug_circle = mpatches.Circle((max_x, max_y), supplied, fill=False, edgecolor='orange', linewidth=1.0, linestyle='--', alpha=0.6)
+                        ax.add_patch(debug_circle)
+                
+                if max_radius_m > 0:
+                    circle = mpatches.Circle((max_x, max_y), max_radius_m, fill=False, edgecolor='#FF0000', linewidth=3, zorder=10)
+                    ax.add_patch(circle)
+                    ax.text(max_x, max_y - max_radius_m - 0.5, f'Max radius: {max_radius_m:.2f}m',
+                           ha='center', fontsize=12, color='#FF0000', fontweight='bold',
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), zorder=11)
         
         return self._render_and_save('passability_index', plot_passability)
 
@@ -465,58 +479,93 @@ class SpatialMetricsVisualizer:
         Returns:
             Dict[str, str]: Output file paths {'clean': ..., 'overlay': ..., 'combined': ...}
         """
-        # Completely separate rendering path for Grid layouts
         morphology_df = self.analyzer.calculate_morphology_stats()
-        if len(morphology_df) == 0: 
-            return {}
+        if len(morphology_df) == 0: return {}
         
-        indices = set()
-        for percentile in np.linspace(0, 100, n_exemplars, endpoint=False):
-            idx = int(len(morphology_df) * percentile / 100)
-            sorted_df = morphology_df.sort_values('solidity')
-            indices.add(sorted_df.index[idx])
-        self._exemplar_indices = sorted(list(indices))
+        # Select two lowest-solidity and two highest-solidity exemplars (preserve order).
+        # If the dataframe is smaller than 4, choose as many unique entries as available.
+        sorted_df = morphology_df.sort_values('solidity')
+        n = len(sorted_df)
+        indices = []
+        # Two lowest
+        for i in range(min(2, n)):
+            indices.append(sorted_df.index[i])
+        # Two highest
+        for i in range(min(2, n)):
+            indices.append(sorted_df.index[n - 1 - i])
+        # Preserve order and deduplicate
+        unique_indices = list(dict.fromkeys(indices))
+        # Respect n_exemplars if provided (optional cap)
+        if n_exemplars is not None and n_exemplars > 0:
+            unique_indices = unique_indices[:n_exemplars]
+        self._exemplar_indices = unique_indices
         polygons = self.analyzer._load_polygons()
         
         def draw_cell(ax, poly, solidity, mode):
-            minx, miny, maxx, maxy = poly.bounds
-            width = maxx - minx
-            height = maxy - miny
-            pad_x, pad_y = width * padding_fraction, height * padding_fraction
+            """
+            Draw a single solidity exemplar cell showing the polygon and convex hull.
             
-            # Apply padding to bounding box
-            bbox_minx = minx - pad_x
-            bbox_miny = miny - pad_y
-            bbox_maxx = maxx + pad_x
-            bbox_maxy = maxy + pad_y
+            Coordinates: polygon bounds are in pixel space, converted to meters for display.
+            For overlay mode, extracts and displays the orthomosaic crop for that region.
+            """
+            # Get polygon bounds in pixel space (original raster coordinates)
+            px_min, py_min, px_max, py_max = poly.bounds
+            width_px = px_max - px_min
+            height_px = py_max - py_min
+            # Apply padding in pixel space
+            pad_px = width_px * padding_fraction
+            pad_py = height_px * padding_fraction
+            crop_px_min = int(px_min - pad_px)
+            crop_py_min = int(py_min - pad_py)
+            crop_px_max = int(px_max + pad_px)
+            crop_py_max = int(py_max + pad_py)
+            
+            # Clamp to image bounds to avoid index errors
+            if self.orthomosaic_array is not None:
+                img_height, img_width = self.orthomosaic_array.shape[:2]
+                crop_px_min = max(0, crop_px_min)
+                crop_py_min = max(0, crop_py_min)
+                crop_px_max = min(img_width, crop_px_max)
+                crop_py_max = min(img_height, crop_py_max)
+            
+            # Convert crop pixel bounds to world coordinates
+            crop_world_xmin = crop_px_min * self.analyzer.meters_per_pixel
+            crop_world_ymin = crop_py_min * self.analyzer.meters_per_pixel
+            crop_world_xmax = crop_px_max * self.analyzer.meters_per_pixel
+            crop_world_ymax = crop_py_max * self.analyzer.meters_per_pixel
             
             if mode == 'clean':
                 ax.set_facecolor('white')
-                poly_coords = np.array(poly.exterior.coords) * self.analyzer.meters_per_pixel
-                ax.add_patch(mpatches.Polygon(poly_coords, fill=True, facecolor='gray', edgecolor='black', alpha=0.8))
                 
             elif mode == 'overlay' and self.orthomosaic_array is not None:
-                row_min, col_min = self._world_to_pixel(bbox_minx * self.analyzer.meters_per_pixel, 
-                                                        bbox_miny * self.analyzer.meters_per_pixel)
-                row_max, col_max = self._world_to_pixel(bbox_maxx * self.analyzer.meters_per_pixel, 
-                                                        bbox_maxy * self.analyzer.meters_per_pixel)
+                # Extract the orthomosaic crop in pixel space
+                img_crop = self.orthomosaic_array[crop_py_min:crop_py_max, crop_px_min:crop_px_max]
                 
-                r_min, r_max = int(min(row_min, row_max)), int(max(row_min, row_max))
-                c_min, c_max = int(min(col_min, col_max)), int(max(col_min, col_max))
-                
-                img_crop = self.orthomosaic_array[r_min:r_max, c_min:c_max]
                 if img_crop.size > 0:
-                    extent = [bbox_minx * self.analyzer.meters_per_pixel, bbox_maxx * self.analyzer.meters_per_pixel, 
-                              bbox_maxy * self.analyzer.meters_per_pixel, bbox_miny * self.analyzer.meters_per_pixel]
+                    # Display crop with extent mapping pixels to world coordinates
+                    extent = [crop_world_xmin, crop_world_xmax, crop_world_ymax, crop_world_ymin]
                     ax.imshow(img_crop, origin='upper', extent=extent)
             
+            # Draw polygon filled in clean mode, outline only in overlay mode
+            poly_coords_m = np.array(poly.exterior.coords) * self.analyzer.meters_per_pixel
+            if mode == 'clean':
+                ax.add_patch(mpatches.Polygon(poly_coords_m, fill=True, facecolor='gray', 
+                                              edgecolor='black', linewidth=0.5, alpha=0.8))
+            else:
+                # In overlay mode, still show polygon outline for reference
+                ax.add_patch(mpatches.Polygon(poly_coords_m, fill=False, edgecolor='white', 
+                                              linewidth=1.0, alpha=0.7))
+            
+            # Draw convex hull in bright neon green (always visible)
             hull = poly.convex_hull
             if hull.geom_type == 'Polygon':
-                hull_coords = np.array(hull.exterior.coords) * self.analyzer.meters_per_pixel
-                ax.add_patch(mpatches.Polygon(hull_coords, fill=False, edgecolor='#00FF00', linewidth=2.5))
+                hull_coords_m = np.array(hull.exterior.coords) * self.analyzer.meters_per_pixel
+                ax.add_patch(mpatches.Polygon(hull_coords_m, fill=False, edgecolor='#00FF00', 
+                                              linewidth=2.5, alpha=0.9))
             
-            ax.set_xlim(bbox_minx * self.analyzer.meters_per_pixel, bbox_maxx * self.analyzer.meters_per_pixel)
-            ax.set_ylim(bbox_maxy * self.analyzer.meters_per_pixel, bbox_miny * self.analyzer.meters_per_pixel)
+            # Set axis limits to show the padded crop region in world coordinates
+            ax.set_xlim(crop_world_xmin, crop_world_xmax)
+            ax.set_ylim(crop_world_ymax, crop_world_ymin)  # Y inverted for image space
             ax.set_aspect('equal')
             ax.set_title(f'Solidity: {solidity:.3f}', fontsize=12, fontweight='bold')
             ax.axis('off')
@@ -548,9 +597,11 @@ class SpatialMetricsVisualizer:
                                  2, 
                                  figsize=(10, 4 * len(self._exemplar_indices)), 
                                  dpi=self.figure_dpi)
+        
         for row_idx, idx in enumerate(self._exemplar_indices):
             draw_cell(axes[row_idx, 0], polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
             draw_cell(axes[row_idx, 1], polygons[idx], morphology_df.iloc[idx]['solidity'], 'overlay')
+        
         plt.tight_layout()
         combined_path = self.output_dir / "solidity_rugosity_combined.png"
         plt.savefig(combined_path, dpi=self.figure_dpi)
