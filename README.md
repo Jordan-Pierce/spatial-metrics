@@ -48,7 +48,67 @@ summary_df, report = analyze(
 )
 ```
 
-## Metrics Reference
+## Visualizations
+
+Generate publication-ready figures for each metric with the **SpatialMetricsVisualizer**.
+
+For each metric, the visualizer automatically produces **three output files**:
+1. **Clean figure** - Metric rendered on white background
+2. **Overlay figure** - Metric overlaid on the original orthorectified image
+3. **Combined figure** - Side-by-side 1x2 subplot for easy comparison
+
+```python
+from src.visualizer import SpatialMetricsVisualizer, visualize_all_metrics
+
+# Create visualizer
+viz = SpatialMetricsVisualizer(
+    analyzer=analyzer,
+    output_dir="figures/",
+    figure_dpi=300  # Publication quality
+)
+
+# Generate all metric visualizations
+results = visualize_all_metrics(analyzer, output_dir="figures/")
+
+# Or generate individual metrics
+nnd_paths = viz.visualize_nearest_neighbor_distance()
+print(f"Nearest Neighbor Distance: {nnd_paths['combined']}")
+
+passability = viz.visualize_passability_index()
+print(f"Passability Index: {passability['combined']}")
+
+solidity = viz.visualize_solidity_rugosity(n_exemplars=4)
+print(f"Solidity/Rugosity: {solidity['combined']}")
+
+directionality = viz.visualize_obb_directionality()
+print(f"OBB Directionality: {directionality['combined']}")
+```
+
+### Visualization Metrics
+
+#### 1. **Nearest Neighbor Distance (Jamming Risk Map)**
+- Shows physical gaps between minerals
+- Highlights high-risk gaps using color coding
+- Useful for collection vehicle path planning
+
+#### 2. **Passability Index (Navigable Corridors)**
+- Displays distance-to-obstacle heatmap
+- Shows maximum passage width for vehicles
+- Critical for route generation algorithms
+
+#### 3. **Solidity / Rugosity (Shape Quality)**
+- Grid of exemplar polygons showing smoothness
+- Highlights defects and jaggedness
+- Helps identify biological vs. mineral artifacts
+
+#### 4. **OBB Directionality (Paleo-current)**
+- Reveals principal axis alignment of elongated objects
+- Indicates paleocurrent direction influence
+- Shows directional patterns in object orientation
+
+**For detailed visualization documentation and examples, see [VISUALIZATION_QUICKSTART.md](VISUALIZATION_QUICKSTART.md)**
+
+
 
 ### Density & Abundance (The "How Much")
 

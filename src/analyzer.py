@@ -2,7 +2,17 @@
 SpatialMetricsAnalyzer: A comprehensive spatial metrics analysis tool for deep-sea mining.
 
 This module provides the SpatialMetricsAnalyzer class for computing spatial metrics
-from orthorectified optical/acoustic imagery, elevation rasters, and GeoJSON annotations.
+from orthorectified optical/acoustic imagery, elevation rasters, and semantic segmentation masks.
+
+SEMANTIC SEGMENTATION MASK STRUCTURE:
+    The analyzer expects semantic segmentation masks with the following class definitions:
+    - 0: Background (non-labeled, outside ROI)
+    - 1: Substrate/Sediment (navigable surface, reference for metrics)
+    - 2: Nodule (target mining object, obstacle for collision avoidance)
+    - 3: Organisms (living creatures, obstacle to preserve and avoid)
+    
+    Substrate (mask==1) is treated as free/navigable space for passability calculations.
+    Objects (mask>=2) are treated as obstacles in collision avoidance metrics.
 
 The metrics are organized into five categories:
     - Density & Abundance: PCF, Resource Density, Spatial Homogeneity
@@ -198,10 +208,16 @@ class SpatialMetricsAnalyzer:
     
     def _load_mask(self) -> np.ndarray:
         """
-        Load and cache the binary mask raster.
+        Load and cache the semantic segmentation mask raster.
+        
+        Mask class definitions:
+            - 0: Background (non-labeled, outside ROI)
+            - 1: Substrate/Sediment (navigable free space)
+            - 2: Nodule (obstacle, target object for mining)
+            - 3: Organisms (obstacle, living creatures to avoid)
         
         Returns:
-            np.ndarray: Binary mask array where 1 indicates target objects.
+            np.ndarray: Semantic mask array with values in [0, 1, 2, 3].
         
         Raises:
             ValueError: If mask_path was not provided.
@@ -212,17 +228,17 @@ class SpatialMetricsAnalyzer:
         if self.mask_path is None:
             raise ValueError("Mask path not provided. Cannot compute mask-based metrics.")
         
-        print("[INFO] Loading mask raster...")
+        print("[INFO] Loading semantic segmentation mask raster...")
         with rasterio.open(self.mask_path) as src:
-            self._mask_data = src.read(1).astype(np.float32)
+            self._mask_data = src.read(1).astype(np.uint8)  # Preserve semantic classes
             self._raster_shape = self._mask_data.shape
             self._raster_transform = src.transform
             
-            # Normalize to binary (0 or 1)
-            if self._mask_data.max() > 1:
-                self._mask_data = (self._mask_data > 0).astype(np.float32)
+            # Validate mask contains expected semantic classes (0, 1, 2, 3)
+            unique_classes = np.unique(self._mask_data)
+            print(f"[INFO] Semantic classes present: {unique_classes}")
         
-        print(f"[INFO] Mask loaded: shape={self._raster_shape}")
+        print(f"[INFO] Semantic mask loaded: shape={self._raster_shape}")
         return self._mask_data
     
     def _load_elevation(self) -> np.ndarray:
@@ -329,6 +345,8 @@ class SpatialMetricsAnalyzer:
                 props.get('category') or 
                 props.get('label') or 
                 props.get('type') or 
+                props.get('short_label_code') or
+                props.get('long_label_code') or
                 'unknown'
             )
             
@@ -391,8 +409,10 @@ class SpatialMetricsAnalyzer:
         # Load mask data
         mask = self._load_mask()
         
-        # Calculate coverage
-        covered_pixels = np.sum(mask > 0)
+        # Calculate coverage (count nodules and organisms, excluding background and substrate)
+        # Mask values: 0=background, 1=substrate, 2=nodule, 3=organisms
+        # Target objects are nodules (2) and organisms (3)
+        covered_pixels = np.sum(mask >= 2)
         total_pixels = mask.size
         
         # Calculate fraction and percentage
@@ -790,9 +810,11 @@ class SpatialMetricsAnalyzer:
         # Load mask data
         mask = self._load_mask()
         
-        # Invert mask: we want distance from free space to obstacles
-        # mask > 0 = obstacle, inverted = free space
-        free_space = (mask == 0).astype(np.float32)
+        # Define free space and obstacles based on semantic mask
+        # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms
+        # Free space is substrate (mask == 1)
+        # Obstacles are nodules and organisms (mask >= 2)
+        free_space = (mask == 1).astype(np.float32)
         
         # Check if there's any free space
         if np.sum(free_space) == 0:
@@ -805,8 +827,8 @@ class SpatialMetricsAnalyzer:
                 'passability_fraction': 0.0
             }
         
-        # Check if there are any obstacles
-        if np.sum(mask > 0) == 0:
+        # Check if there are any obstacles (nodules or organisms)
+        if np.sum(mask >= 2) == 0:
             print("[WARNING] No obstacles found in mask - infinite passability")
             diagonal = np.sqrt(mask.shape[0]**2 + mask.shape[1]**2) * self.meters_per_pixel
             return {
@@ -821,8 +843,15 @@ class SpatialMetricsAnalyzer:
         # EDT gives distance from each free pixel to nearest obstacle
         edt = ndimage.distance_transform_edt(free_space)
         
-        # Find maximum radius (the largest inscribed circle)
+        # Find maximum radius (the largest inscribed circle) and its location
         max_radius_px = np.max(edt)
+        max_idx = np.unravel_index(np.argmax(edt), edt.shape)
+        max_pixel_row, max_pixel_col = max_idx
+        
+        # Convert pixel coordinates to world coordinates (meters)
+        max_world_x = max_pixel_col * self.meters_per_pixel
+        max_world_y = max_pixel_row * self.meters_per_pixel
+        
         max_radius_m = max_radius_px * self.meters_per_pixel
         max_diameter_m = 2 * max_radius_m
         
@@ -837,12 +866,17 @@ class SpatialMetricsAnalyzer:
         results = {
             'max_passage_diameter_m': float(max_diameter_m),
             'max_passage_radius_m': float(max_radius_m),
+            'max_passage_x_m': float(max_world_x),
+            'max_passage_y_m': float(max_world_y),
+            'max_passage_pixel_row': int(max_pixel_row),
+            'max_passage_pixel_col': int(max_pixel_col),
             'mean_clearance_m': float(mean_clearance_m),
             'median_clearance_m': float(median_clearance_m),
             'passability_fraction': float(passability_fraction)
         }
         
         print(f"  → Max passage diameter: {max_diameter_m:.4f} m")
+        print(f"  → Max passage location: ({max_world_x:.4f}, {max_world_y:.4f}) m")
         print(f"  → Mean clearance: {mean_clearance_m:.4f} m")
         print(f"  → Free space: {passability_fraction * 100:.2f}%")
         
@@ -1342,9 +1376,12 @@ class SpatialMetricsAnalyzer:
                 f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
             )
         
-        # Identify sediment (background) and object pixels
-        sediment_mask = (mask == 0) & (~np.isnan(elevation))
-        object_mask = (mask > 0) & (~np.isnan(elevation))
+        # Identify sediment (substrate) and object pixels
+        # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms
+        # Substrate (mask == 1) is the reference seafloor elevation
+        # Objects (mask >= 2) are nodules and organisms
+        sediment_mask = (mask == 1) & (~np.isnan(elevation))
+        object_mask = (mask >= 2) & (~np.isnan(elevation))
         
         if not np.any(sediment_mask):
             print("[WARNING] No sediment pixels found for seafloor estimation")
@@ -1592,6 +1629,535 @@ class SpatialMetricsAnalyzer:
         
         return results
     
+    def calculate_exposed_volume(self) -> Dict[str, Any]:
+        """
+        Calculate Exposed Volume - The Yield Metric.
+        
+        This metric calculates the true physical volume protruding above the
+        seafloor baseline by integrating stick-up heights across all object pixels.
+        Unlike simplified sphere assumptions, this accounts for actual 3D shape.
+        
+        Method:
+            1. Establish virtual seafloor plane (median of sediment pixels)
+            2. Calculate stick-up height for each object pixel
+            3. Integrate: Volume = Σ(height_i × pixel_area)
+            4. Compute statistics and per-object volumes
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'total_exposed_volume_m3': Total volume of exposed nodules
+                - 'mean_volume_per_object_m3': Average volume per polygon
+                - 'volume_distribution': Histogram of volumes (20 bins)
+                - 'per_object_volumes': List of volumes per polygon
+                - 'num_exposed_pixels': Count of pixels protruding above seafloor
+                - 'seafloor_elevation_m': Estimated baseline elevation
+        
+        Raises:
+            ValueError: If elevation_path or mask_path was not provided.
+        
+        Example:
+            >>> analyzer = SpatialMetricsAnalyzer(
+            ...     elevation_path="depth.tif",
+            ...     mask_path="nodules.tif"
+            ... )
+            >>> volume = analyzer.calculate_exposed_volume()
+            >>> print(f"Total yield: {volume['total_exposed_volume_m3']:.2f} m³")
+        """
+        print("\n[METRIC] Calculating Exposed Volume...")
+        
+        # Load required data
+        elevation = self._load_elevation()
+        mask = self._load_mask()
+        
+        # Ensure same shape
+        if elevation.shape != mask.shape:
+            raise ValueError(
+                f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
+            )
+        
+        # Identify sediment and object pixels (exclude NaN)
+        # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms
+        # Substrate (mask == 1) is the reference seafloor elevation
+        # Objects (mask >= 2) are nodules and organisms
+        sediment_mask = (mask == 1) & (~np.isnan(elevation))
+        object_mask = (mask >= 2) & (~np.isnan(elevation))
+        
+        if not np.any(sediment_mask):
+            print("[WARNING] No sediment pixels found for seafloor estimation")
+            return {
+                'total_exposed_volume_m3': 0.0,
+                'mean_volume_per_object_m3': 0.0,
+                'volume_distribution': {'counts': [], 'bin_edges': []},
+                'per_object_volumes': [],
+                'num_exposed_pixels': 0,
+                'seafloor_elevation_m': 0.0
+            }
+        
+        if not np.any(object_mask):
+            print("[WARNING] No object pixels found in mask")
+            return {
+                'total_exposed_volume_m3': 0.0,
+                'mean_volume_per_object_m3': 0.0,
+                'volume_distribution': {'counts': [], 'bin_edges': []},
+                'per_object_volumes': [],
+                'num_exposed_pixels': 0,
+                'seafloor_elevation_m': float(np.nanmedian(elevation[sediment_mask]))
+            }
+        
+        # -----------------------------------------------------------------
+        # ESTIMATE SEAFLOOR PLANE (median of sediment pixels)
+        # -----------------------------------------------------------------
+        print("  Estimating virtual seafloor plane...")
+        sediment_elevations = elevation[sediment_mask]
+        seafloor_elevation = np.median(sediment_elevations)
+        
+        # -----------------------------------------------------------------
+        # CALCULATE STICK-UP HEIGHTS AND VOLUME
+        # -----------------------------------------------------------------
+        object_elevations = elevation[object_mask]
+        stick_up_heights = object_elevations - seafloor_elevation
+        
+        # Keep only positive heights (objects protruding upward)
+        valid_heights = stick_up_heights[stick_up_heights > 0]
+        num_exposed_pixels = len(valid_heights)
+        
+        if num_exposed_pixels == 0:
+            print("[WARNING] No pixels protruding above seafloor")
+            return {
+                'total_exposed_volume_m3': 0.0,
+                'mean_volume_per_object_m3': 0.0,
+                'volume_distribution': {'counts': [], 'bin_edges': []},
+                'per_object_volumes': [],
+                'num_exposed_pixels': 0,
+                'seafloor_elevation_m': float(seafloor_elevation)
+            }
+        
+        # Calculate pixel area in square meters
+        pixel_area_m2 = self.meters_per_pixel ** 2
+        
+        # Volume integration: V = Σ(height_i × pixel_area)
+        volumes = valid_heights * pixel_area_m2
+        total_exposed_volume = float(np.sum(volumes))
+        
+        # Create histogram
+        hist, bin_edges = np.histogram(volumes, bins=20)
+        volume_distribution = {
+            'counts': hist.tolist(),
+            'bin_edges': bin_edges.tolist()
+        }
+        
+        # -----------------------------------------------------------------
+        # PER-OBJECT VOLUMES (if polygons available)
+        # -----------------------------------------------------------------
+        per_object_volumes = []
+        if self.geojson_path is not None:
+            try:
+                polygons = self._load_polygons()
+                print(f"  Calculating per-object volumes for {len(polygons)} objects...")
+                
+                for i, poly in enumerate(tqdm(polygons, desc="Per-object volumes", unit="obj")):
+                    minx, miny, maxx, maxy = poly.bounds
+                    
+                    # Convert to pixel coordinates
+                    row_min = int(max(0, miny))
+                    row_max = int(min(elevation.shape[0], maxy + 1))
+                    col_min = int(max(0, minx))
+                    col_max = int(min(elevation.shape[1], maxx + 1))
+                    
+                    if row_max > row_min and col_max > col_min:
+                        region_elev = elevation[row_min:row_max, col_min:col_max]
+                        region_mask = mask[row_min:row_max, col_min:col_max]
+                        
+                        obj_pixels = region_elev[(region_mask > 0) & (~np.isnan(region_elev))]
+                        if len(obj_pixels) > 0:
+                            obj_heights = obj_pixels - seafloor_elevation
+                            obj_heights = obj_heights[obj_heights > 0]
+                            if len(obj_heights) > 0:
+                                obj_volume = float(np.sum(obj_heights) * pixel_area_m2)
+                                per_object_volumes.append({
+                                    'polygon_id': i,
+                                    'exposed_volume_m3': obj_volume
+                                })
+                        
+            except Exception as e:
+                print(f"[WARNING] Could not compute per-object volumes: {e}")
+        
+        # Mean volume per object
+        mean_volume = (total_exposed_volume / len(per_object_volumes)) if per_object_volumes else 0.0
+        
+        results = {
+            'total_exposed_volume_m3': total_exposed_volume,
+            'mean_volume_per_object_m3': float(mean_volume),
+            'volume_distribution': volume_distribution,
+            'per_object_volumes': per_object_volumes,
+            'num_exposed_pixels': int(num_exposed_pixels),
+            'seafloor_elevation_m': float(seafloor_elevation)
+        }
+        
+        print(f"  → Total exposed volume: {total_exposed_volume:.4f} m³")
+        print(f"  → Exposed pixels: {num_exposed_pixels}")
+        print(f"  → Mean volume per object: {mean_volume:.4f} m³")
+        
+        return results
+    
+    def calculate_embedment_angle(self) -> Dict[str, Any]:
+        """
+        Calculate Embedment Angle - The Breakout Force Metric.
+        
+        This metric measures the steepness of the contact slope where nodules
+        meet the sediment. Steep angles indicate objects sitting on top (easy
+        extraction), shallow angles indicate burial/draping (difficult extraction).
+        
+        Method:
+            1. Extract perimeter pixels (boundary of object mask)
+            2. Calculate elevation gradients (dz/dx, dz/dy)
+            3. Compute slope angles at perimeter
+            4. Return statistics on contact steepness
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'mean_contact_angle_deg': Mean contact slope in degrees
+                - 'median_contact_angle_deg': Median contact slope
+                - 'std_contact_angle_deg': Standard deviation
+                - 'min_angle_deg': Minimum angle (most buried)
+                - 'max_angle_deg': Maximum angle (most exposed)
+                - 'perimeter_pixels_analyzed': Count of boundary pixels
+                - 'per_object_angles': Per-polygon angle statistics
+        
+        Raises:
+            ValueError: If elevation_path or mask_path was not provided.
+        
+        Example:
+            >>> analyzer = SpatialMetricsAnalyzer(
+            ...     elevation_path="depth.tif",
+            ...     mask_path="nodules.tif"
+            ... )
+            >>> embedment = analyzer.calculate_embedment_angle()
+            >>> print(f"Mean contact angle: {embedment['mean_contact_angle_deg']:.1f}°")
+        """
+        print("\n[METRIC] Calculating Embedment Angle...")
+        
+        # Load required data
+        elevation = self._load_elevation()
+        mask = self._load_mask()
+        
+        if elevation.shape != mask.shape:
+            raise ValueError(
+                f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
+            )
+        
+        # -----------------------------------------------------------------
+        # EXTRACT PERIMETER PIXELS
+        # -----------------------------------------------------------------
+        from scipy.ndimage import binary_dilation
+        
+        dilated = binary_dilation(mask > 0, iterations=1)
+        perimeter_mask = dilated & ~(mask > 0)
+        
+        if not np.any(perimeter_mask):
+            print("[WARNING] No perimeter pixels found")
+            return {
+                'mean_contact_angle_deg': 0.0,
+                'median_contact_angle_deg': 0.0,
+                'std_contact_angle_deg': 0.0,
+                'min_angle_deg': 0.0,
+                'max_angle_deg': 0.0,
+                'perimeter_pixels_analyzed': 0,
+                'per_object_angles': []
+            }
+        
+        # -----------------------------------------------------------------
+        # COMPUTE ELEVATION GRADIENTS
+        # -----------------------------------------------------------------
+        dz_dx, dz_dy = np.gradient(elevation)
+        
+        # Extract gradients at perimeter pixels
+        perimeter_indices = np.where(perimeter_mask)
+        dz_dx_perim = dz_dx[perimeter_indices]
+        dz_dy_perim = dz_dy[perimeter_indices]
+        
+        # Gradient magnitude
+        gradient_magnitude = np.sqrt(dz_dx_perim**2 + dz_dy_perim**2)
+        
+        # -----------------------------------------------------------------
+        # COMPUTE ANGLES IN DEGREES
+        # -----------------------------------------------------------------
+        angles_rad = np.arctan(gradient_magnitude)
+        angles_deg = np.degrees(angles_rad)
+        
+        # Filter out NaN/Inf
+        valid_angles = angles_deg[~np.isnan(angles_deg) & ~np.isinf(angles_deg)]
+        
+        if len(valid_angles) == 0:
+            print("[WARNING] No valid angles computed")
+            return {
+                'mean_contact_angle_deg': 0.0,
+                'median_contact_angle_deg': 0.0,
+                'std_contact_angle_deg': 0.0,
+                'min_angle_deg': 0.0,
+                'max_angle_deg': 0.0,
+                'perimeter_pixels_analyzed': len(angles_deg),
+                'per_object_angles': []
+            }
+        
+        # Calculate statistics
+        mean_angle = float(np.mean(valid_angles))
+        median_angle = float(np.median(valid_angles))
+        std_angle = float(np.std(valid_angles))
+        min_angle = float(np.min(valid_angles))
+        max_angle = float(np.max(valid_angles))
+        
+        # -----------------------------------------------------------------
+        # PER-OBJECT ANGLES (if polygons available)
+        # -----------------------------------------------------------------
+        per_object_angles = []
+        if self.geojson_path is not None:
+            try:
+                polygons = self._load_polygons()
+                print(f"  Calculating per-object angles for {len(polygons)} objects...")
+                
+                for i, poly in enumerate(tqdm(polygons, desc="Per-object angles", unit="obj")):
+                    minx, miny, maxx, maxy = poly.bounds
+                    
+                    row_min = int(max(0, miny))
+                    row_max = int(min(elevation.shape[0], maxy + 1))
+                    col_min = int(max(0, minx))
+                    col_max = int(min(elevation.shape[1], maxx + 1))
+                    
+                    if row_max > row_min and col_max > col_min:
+                        region_mask = mask[row_min:row_max, col_min:col_max]
+                        region_dz_dx = dz_dx[row_min:row_max, col_min:col_max]
+                        region_dz_dy = dz_dy[row_min:row_max, col_min:col_max]
+                        
+                        # Dilate region mask
+                        region_dilated = binary_dilation(region_mask > 0, iterations=1)
+                        region_perim = region_dilated & ~(region_mask > 0)
+                        
+                        if np.any(region_perim):
+                            perim_grad = np.sqrt(
+                                region_dz_dx[region_perim]**2 + region_dz_dy[region_perim]**2
+                            )
+                            perim_angles = np.degrees(np.arctan(perim_grad))
+                            perim_angles = perim_angles[~np.isnan(perim_angles) & ~np.isinf(perim_angles)]
+                            
+                            if len(perim_angles) > 0:
+                                per_object_angles.append({
+                                    'polygon_id': i,
+                                    'mean_angle_deg': float(np.mean(perim_angles)),
+                                    'max_angle_deg': float(np.max(perim_angles))
+                                })
+                        
+            except Exception as e:
+                print(f"[WARNING] Could not compute per-object angles: {e}")
+        
+        results = {
+            'mean_contact_angle_deg': mean_angle,
+            'median_contact_angle_deg': median_angle,
+            'std_contact_angle_deg': std_angle,
+            'min_angle_deg': min_angle,
+            'max_angle_deg': max_angle,
+            'perimeter_pixels_analyzed': int(len(valid_angles)),
+            'per_object_angles': per_object_angles
+        }
+        
+        print(f"  → Mean contact angle: {mean_angle:.2f}°")
+        print(f"  → Range: [{min_angle:.2f}°, {max_angle:.2f}°]")
+        print(f"  → Perimeter pixels: {len(valid_angles)}")
+        
+        return results
+    
+    def calculate_sediment_scour_anisotropy(self, ring_width_pixels: int = 5) -> Dict[str, Any]:
+        """
+        Calculate Sediment Scour Anisotropy - The Environmental History Metric.
+        
+        This metric analyzes asymmetry in sediment elevation around nodules,
+        using the mud as a "current meter". An asymmetric scour (deep on one side,
+        shallow on the other) indicates current direction and magnitude of disturbance.
+        
+        Method:
+            1. Create a ring mask around objects (dilated boundary)
+            2. Find minimum (scour) and maximum (wake) in ring
+            3. Compute vector angle from scour to wake
+            4. Calculate magnitude of anisotropy (elevation difference)
+            5. Repeat per-object
+        
+        Args:
+            ring_width_pixels: Width of ring to analyze (default: 5 pixels)
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'global': Global-scale scour results (dominant current)
+                  - 'dominant_angle_deg': Direction 0-360° (0°=East, 90°=North)
+                  - 'scour_depth_m': Elevation of deepest scour point
+                  - 'wake_height_m': Elevation of highest wake point
+                  - 'anisotropy_magnitude_m': Elevation difference
+                  - 'ring_sample_size': Number of ring pixels
+                - 'per_object': List of per-polygon scour results
+                  - 'polygon_id': Polygon identifier
+                  - 'dominant_angle_deg': Local current direction
+                  - 'anisotropy_magnitude_m': Local elevation asymmetry
+        
+        Raises:
+            ValueError: If elevation_path or mask_path was not provided.
+        
+        Example:
+            >>> analyzer = SpatialMetricsAnalyzer(
+            ...     elevation_path="depth.tif",
+            ...     mask_path="nodules.tif"
+            ... )
+            >>> scour = analyzer.calculate_sediment_scour_anisotropy(ring_width_pixels=5)
+            >>> print(f"Current direction: {scour['global']['dominant_angle_deg']:.0f}°")
+        """
+        print("\n[METRIC] Calculating Sediment Scour Anisotropy...")
+        
+        from scipy.ndimage import binary_dilation
+        
+        # Load required data
+        elevation = self._load_elevation()
+        mask = self._load_mask()
+        
+        if elevation.shape != mask.shape:
+            raise ValueError(
+                f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
+            )
+        
+        # -----------------------------------------------------------------
+        # GLOBAL ANALYSIS: CREATE RING MASK
+        # -----------------------------------------------------------------
+        print("  Computing global scour anisotropy...")
+        dilated = binary_dilation(mask > 0, iterations=ring_width_pixels)
+        ring_mask = dilated & ~(mask > 0)
+        
+        global_result = {
+            'dominant_angle_deg': None,
+            'scour_depth_m': None,
+            'wake_height_m': None,
+            'anisotropy_magnitude_m': None,
+            'ring_sample_size': 0
+        }
+        
+        if np.any(ring_mask):
+            # Extract ring elevations and coordinates
+            ring_indices = np.where(ring_mask)
+            ring_elevations = elevation[ring_indices]
+            ring_x = ring_indices[1]  # Column indices
+            ring_y = ring_indices[0]  # Row indices
+            
+            # Filter NaN values
+            valid_mask = ~np.isnan(ring_elevations)
+            if np.any(valid_mask):
+                valid_elev = ring_elevations[valid_mask]
+                valid_x = ring_x[valid_mask]
+                valid_y = ring_y[valid_mask]
+                
+                # Find scour (minimum) and wake (maximum)
+                scour_idx = np.nanargmin(ring_elevations)
+                wake_idx = np.nanargmax(ring_elevations)
+                
+                scour_x, scour_y = ring_x[scour_idx], ring_y[scour_idx]
+                wake_x, wake_y = ring_x[wake_idx], ring_y[wake_idx]
+                scour_elev = ring_elevations[scour_idx]
+                wake_elev = ring_elevations[wake_idx]
+                
+                # Compute current direction (vector from scour to wake)
+                delta_x = wake_x - scour_x
+                delta_y = wake_y - scour_y
+                
+                # Convert to meters
+                delta_x_m = delta_x * self.meters_per_pixel
+                delta_y_m = delta_y * self.meters_per_pixel
+                
+                # Angle: 0° = East, 90° = North
+                angle_rad = np.arctan2(delta_y_m, delta_x_m)
+                angle_deg = np.degrees(angle_rad)
+                
+                # Normalize to [0, 360)
+                if angle_deg < 0:
+                    angle_deg += 360
+                
+                # Anisotropy magnitude
+                anisotropy_mag = wake_elev - scour_elev
+                
+                global_result = {
+                    'dominant_angle_deg': float(angle_deg),
+                    'scour_depth_m': float(scour_elev),
+                    'wake_height_m': float(wake_elev),
+                    'anisotropy_magnitude_m': float(anisotropy_mag),
+                    'ring_sample_size': int(np.sum(valid_mask))
+                }
+        
+        # -----------------------------------------------------------------
+        # PER-OBJECT ANALYSIS (if polygons available)
+        # -----------------------------------------------------------------
+        per_object_results = []
+        if self.geojson_path is not None:
+            try:
+                polygons = self._load_polygons()
+                print(f"  Calculating per-object scour for {len(polygons)} objects...")
+                
+                for i, poly in enumerate(tqdm(polygons, desc="Per-object scour", unit="obj")):
+                    minx, miny, maxx, maxy = poly.bounds
+                    
+                    row_min = int(max(0, miny))
+                    row_max = int(min(elevation.shape[0], maxy + 1))
+                    col_min = int(max(0, minx))
+                    col_max = int(min(elevation.shape[1], maxx + 1))
+                    
+                    if row_max > row_min and col_max > col_min:
+                        region_mask = mask[row_min:row_max, col_min:col_max]
+                        region_elev = elevation[row_min:row_max, col_min:col_max]
+                        
+                        # Create ring for this object
+                        region_dilated = binary_dilation(region_mask > 0, iterations=ring_width_pixels)
+                        region_ring = region_dilated & ~(region_mask > 0)
+                        
+                        if np.any(region_ring):
+                            ring_elev_region = region_elev[region_ring]
+                            valid_mask_region = ~np.isnan(ring_elev_region)
+                            
+                            if np.any(valid_mask_region):
+                                scour_elev_obj = np.nanmin(ring_elev_region)
+                                wake_elev_obj = np.nanmax(ring_elev_region)
+                                aniso_obj = wake_elev_obj - scour_elev_obj
+                                
+                                # Find indices for angle calculation
+                                scour_idx_obj = np.nanargmin(ring_elev_region)
+                                wake_idx_obj = np.nanargmax(ring_elev_region)
+                                
+                                ring_indices_obj = np.where(region_ring)
+                                scour_y_obj = ring_indices_obj[0][scour_idx_obj]
+                                scour_x_obj = ring_indices_obj[1][scour_idx_obj]
+                                wake_y_obj = ring_indices_obj[0][wake_idx_obj]
+                                wake_x_obj = ring_indices_obj[1][wake_idx_obj]
+                                
+                                delta_x_obj = wake_x_obj - scour_x_obj
+                                delta_y_obj = wake_y_obj - scour_y_obj
+                                
+                                angle_obj = np.degrees(np.arctan2(delta_y_obj, delta_x_obj))
+                                if angle_obj < 0:
+                                    angle_obj += 360
+                                
+                                per_object_results.append({
+                                    'polygon_id': i,
+                                    'dominant_angle_deg': float(angle_obj),
+                                    'anisotropy_magnitude_m': float(aniso_obj)
+                                })
+                        
+            except Exception as e:
+                print(f"[WARNING] Could not compute per-object scour: {e}")
+        
+        results = {
+            'global': global_result,
+            'per_object': per_object_results
+        }
+        
+        if global_result['dominant_angle_deg'] is not None:
+            print(f"  → Global current direction: {global_result['dominant_angle_deg']:.0f}°")
+            print(f"  → Anisotropy magnitude: {global_result['anisotropy_magnitude_m']:.4f} m")
+            print(f"  → Ring sample size: {global_result['ring_sample_size']} pixels")
+        
+        return results
+    
     # =========================================================================
     # ECOSYSTEM DYNAMICS METRICS
     # =========================================================================
@@ -1787,6 +2353,559 @@ class SpatialMetricsAnalyzer:
         
         return results
     
+    def calculate_bivariate_ripleys_k(
+        self,
+        class_a: str = 'nodule',
+        class_b: str = 'organism',
+        radii: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """
+        Calculate Bivariate Ripley's K - The Invisible Halo Metric.
+        
+        This metric statistically tests whether one population class clusters
+        around another more than random chance would predict. It reveals
+        "invisible halos" of spatial dependence between organisms and resources.
+        
+        Method:
+            1. Extract centroids for both classes
+            2. Build KDTree on class B centroids for efficient queries
+            3. For each radius, count class B points within distance of class A
+            4. Compare to Poisson random null model
+            5. K(r) > expected indicates attraction; K(r) < expected indicates repulsion
+        
+        Args:
+            class_a: Source class name (e.g., 'nodule'). Default: 'nodule'.
+            class_b: Target class name (e.g., 'organism'). Default: 'organism'.
+            radii: Optional list of radii in meters. If None, auto-generated
+                  as log-spaced from 0.1m to max observed distance (~20 radii).
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'class_a': Source class name
+                - 'class_b': Target class name
+                - 'radii_m': List of radii analyzed (meters)
+                - 'observed_counts': Observed count of class B around class A
+                - 'expected_poisson_counts': Expected counts under random model
+                - 'k_values': K(r) statistic (ratio of observed to expected)
+                - 'interpretation': Text description of relationship
+                - 'n_class_a': Number of class A objects
+                - 'n_class_b': Number of class B objects
+        
+        Raises:
+            ValueError: If geojson_path was not provided.
+        
+        Example:
+            >>> analyzer = SpatialMetricsAnalyzer(geojson_path="annotations.geojson")
+            >>> ripley = analyzer.calculate_bivariate_ripleys_k('nodule', 'sponge')
+            >>> print(f"Attraction: {ripley['interpretation']}")
+        
+        Note:
+            A peak in K(r) above the Poisson line indicates clustering of class B
+            around class A at that particular scale. This reveals which organisms
+            are spatially dependent on the resource.
+        """
+        print(f"\n[METRIC] Calculating Bivariate Ripley's K...")
+        print(f"  Class A: '{class_a}', Class B: '{class_b}'")
+        
+        # Load polygons with class labels
+        polygons_by_class = self._load_polygons_with_classes()
+        available_classes = list(polygons_by_class.keys())
+        print(f"  Available classes: {available_classes}")
+        
+        # Mirror existing error handling pattern
+        if class_a not in polygons_by_class:
+            print(f"[WARNING] Class A '{class_a}' not found. Available: {available_classes}")
+            class_a_polys = []
+            for cls in available_classes:
+                if 'nodule' in cls.lower() or 'rock' in cls.lower():
+                    class_a_polys = polygons_by_class[cls]
+                    print(f"  Using '{cls}' as class A")
+                    break
+        else:
+            class_a_polys = polygons_by_class[class_a]
+        
+        if class_b not in polygons_by_class:
+            print(f"[WARNING] Class B '{class_b}' not found. Available: {available_classes}")
+            class_b_polys = []
+            for cls in available_classes:
+                if any(term in cls.lower() for term in ['organism', 'sponge', 'coral', 'fauna', 'bio']):
+                    class_b_polys = polygons_by_class[cls]
+                    print(f"  Using '{cls}' as class B")
+                    break
+        else:
+            class_b_polys = polygons_by_class[class_b]
+        
+        if len(class_a_polys) < 1 or len(class_b_polys) < 1:
+            print("[WARNING] Insufficient data for Ripley's K analysis")
+            return {
+                'class_a': class_a,
+                'class_b': class_b,
+                'radii_m': [],
+                'observed_counts': [],
+                'expected_poisson_counts': [],
+                'k_values': [],
+                'interpretation': 'Insufficient data - one or both classes empty',
+                'n_class_a': len(class_a_polys),
+                'n_class_b': len(class_b_polys)
+            }
+        
+        # Extract centroids
+        print(f"  Extracting centroids: {len(class_a_polys)} class A, {len(class_b_polys)} class B")
+        centroids_a = np.array([[p.centroid.x, p.centroid.y] for p in class_a_polys])
+        centroids_b = np.array([[p.centroid.x, p.centroid.y] for p in class_b_polys])
+        
+        # Convert to meters
+        centroids_a_m = centroids_a * self.meters_per_pixel
+        centroids_b_m = centroids_b * self.meters_per_pixel
+        
+        # -----------------------------------------------------------------
+        # GENERATE RADII IF NOT PROVIDED
+        # -----------------------------------------------------------------
+        if radii is None:
+            max_distance = np.max(np.abs(centroids_b_m)) + np.max(np.abs(centroids_a_m))
+            if max_distance > 0:
+                min_radius = 0.1  # meters
+                radii = np.logspace(np.log10(min_radius), np.log10(max_distance), num=20)
+            else:
+                radii = np.logspace(-1, 1, num=20)
+        
+        radii = np.array(radii)
+        print(f"  Analyzing {len(radii)} radii: {radii[0]:.2f}m to {radii[-1]:.2f}m")
+        
+        # -----------------------------------------------------------------
+        # BUILD KDTREE AND COUNT NEIGHBORS
+        # -----------------------------------------------------------------
+        tree = KDTree(centroids_b_m)
+        
+        observed_counts = []
+        for r in tqdm(radii, desc="Ripley's K analysis", unit="radius"):
+            count = 0
+            for pt_a in centroids_a_m:
+                neighbors = tree.query_ball_point(pt_a, r)
+                count += len(neighbors)
+            observed_counts.append(int(count))
+        
+        # -----------------------------------------------------------------
+        # COMPUTE EXPECTED POISSON DISTRIBUTION
+        # -----------------------------------------------------------------
+        # Estimate total area from mask or bounding box
+        if self.mask_path is not None:
+            mask = self._load_mask()
+            total_area_m2 = mask.size * (self.meters_per_pixel ** 2)
+        else:
+            # Estimate from bounding box
+            all_centroids = np.vstack([centroids_a_m, centroids_b_m])
+            x_range = np.max(all_centroids[:, 0]) - np.min(all_centroids[:, 0])
+            y_range = np.max(all_centroids[:, 1]) - np.min(all_centroids[:, 1])
+            total_area_m2 = x_range * y_range
+        
+        # Density of class B
+        density_b = len(centroids_b) / total_area_m2 if total_area_m2 > 0 else 0
+        
+        # Expected counts under Poisson
+        expected_counts = [density_b * np.pi * r**2 * len(centroids_a) for r in radii]
+        
+        # -----------------------------------------------------------------
+        # COMPUTE K-VALUES
+        # -----------------------------------------------------------------
+        density_a = len(centroids_a) / total_area_m2 if total_area_m2 > 0 else 1.0
+        k_values = []
+        for obs, r in zip(observed_counts, radii):
+            if r > 0:
+                k_val = obs / (density_a * np.pi * r**2) if density_a > 0 else 0
+            else:
+                k_val = 0
+            k_values.append(float(k_val))
+        
+        # -----------------------------------------------------------------
+        # INTERPRETATION
+        # -----------------------------------------------------------------
+        if len(k_values) > 0:
+            mean_expected = np.mean(expected_counts)
+            mean_k = np.mean(k_values)
+            
+            if mean_k > mean_expected * 1.2:
+                interpretation = "Attraction: class B clusters around class A"
+            elif mean_k < mean_expected * 0.8:
+                interpretation = "Repulsion: class B avoids class A"
+            else:
+                interpretation = "Random distribution: no significant spatial dependence"
+        else:
+            interpretation = "Unable to interpret"
+        
+        results = {
+            'class_a': class_a,
+            'class_b': class_b,
+            'radii_m': radii.tolist(),
+            'observed_counts': observed_counts,
+            'expected_poisson_counts': [float(e) for e in expected_counts],
+            'k_values': k_values,
+            'interpretation': interpretation,
+            'n_class_a': len(class_a_polys),
+            'n_class_b': len(class_b_polys)
+        }
+        
+        print(f"  → Mean K-value: {mean_k:.4f}")
+        print(f"  → Interpretation: {interpretation}")
+        
+        return results
+    
+    def calculate_beta_diversity_turnover(
+        self,
+        grid_size: int = 4,
+        diversity_metric: str = 'jaccard'
+    ) -> Dict[str, Any]:
+        """
+        Calculate Beta Diversity Turnover - The Community Drift Metric.
+        
+        This metric quantifies how species composition changes across the survey
+        site (community drift). It measures whether the same organisms appear
+        everywhere or if communities shift in space.
+        
+        Method:
+            1. Divide survey area into grid cells
+            2. Identify which biological classes are present in each cell
+            3. Compare adjacent cells using Jaccard or Sorensen distance
+            4. Average distances across all cell pairs
+        
+        Args:
+            grid_size: Number of grid cells per dimension (default: 4).
+                      Total cells = grid_size × grid_size.
+            diversity_metric: Distance metric - 'jaccard' (default) or 'sorensen'.
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'diversity_metric': Metric used ('jaccard' or 'sorensen')
+                - 'mean_distance': Mean pairwise distance (0-1)
+                - 'std_distance': Standard deviation of distances
+                - 'min_distance': Minimum pairwise distance
+                - 'max_distance': Maximum pairwise distance
+                - 'grid_size': Grid dimensions used
+                - 'n_cells_analyzed': Number of cells
+                - 'n_cells_with_biology': Number of cells with organisms
+                - 'per_cell_species': Species list per grid cell (for detailed analysis)
+                - 'interpretation': Text summary
+        
+        Raises:
+            ValueError: If geojson_path was not provided.
+        
+        Example:
+            >>> analyzer = SpatialMetricsAnalyzer(geojson_path="annotations.geojson")
+            >>> beta = analyzer.calculate_beta_diversity_turnover(grid_size=5)
+            >>> print(f"Community drift: {beta['interpretation']}")
+        
+        Note:
+            Values close to 0 indicate stable communities (low turnover).
+            Values close to 1 indicate high species turnover (community drift).
+        """
+        print(f"\n[METRIC] Calculating Beta Diversity Turnover (metric={diversity_metric})...")
+        
+        if diversity_metric not in ['jaccard', 'sorensen']:
+            raise ValueError("diversity_metric must be 'jaccard' or 'sorensen'")
+        
+        # Load polygons with class labels
+        polygons_by_class = self._load_polygons_with_classes()
+        
+        if not polygons_by_class:
+            print("[WARNING] No polygons found")
+            return {
+                'diversity_metric': diversity_metric,
+                'mean_distance': 0.0,
+                'std_distance': 0.0,
+                'min_distance': 0.0,
+                'max_distance': 0.0,
+                'grid_size': grid_size,
+                'n_cells_analyzed': grid_size * grid_size,
+                'n_cells_with_biology': 0,
+                'per_cell_species': {},
+                'interpretation': 'No biological data'
+            }
+        
+        # Flatten polygons and get bounding box
+        all_polygons = sum(polygons_by_class.values(), [])
+        all_centroids = np.array([[p.centroid.x, p.centroid.y] for p in all_polygons])
+        
+        min_x, min_y = all_centroids.min(axis=0)
+        max_x, max_y = all_centroids.max(axis=0)
+        
+        # Create grid
+        print(f"  Creating {grid_size}x{grid_size} grid")
+        x_edges = np.linspace(min_x, max_x, grid_size + 1)
+        y_edges = np.linspace(min_y, max_y, grid_size + 1)
+        
+        # Identify species per cell
+        grid_species = {}  # key: (i, j), value: set of class names
+        
+        print(f"  Identifying species in each grid cell...")
+        for i in tqdm(range(grid_size), desc="Grid analysis", unit="row"):
+            for j in range(grid_size):
+                x_min, x_max = x_edges[j], x_edges[j + 1]
+                y_min, y_max = y_edges[i], y_edges[i + 1]
+                
+                cell_species = set()
+                for class_name, polys in polygons_by_class.items():
+                    for poly in polys:
+                        if x_min <= poly.centroid.x < x_max and y_min <= poly.centroid.y < y_max:
+                            cell_species.add(class_name)
+                            break  # Only need 1 representative per class per cell
+                
+                grid_species[(i, j)] = cell_species
+        
+        # -----------------------------------------------------------------
+        # DEFINE DISTANCE METRICS
+        # -----------------------------------------------------------------
+        def jaccard_distance(set_a, set_b):
+            union_size = len(set_a | set_b)
+            if union_size == 0:
+                return 0.0
+            return 1.0 - (len(set_a & set_b) / union_size)
+        
+        def sorensen_distance(set_a, set_b):
+            denom = len(set_a) + len(set_b)
+            if denom == 0:
+                return 0.0
+            return 1.0 - (2 * len(set_a & set_b) / denom)
+        
+        distance_func = jaccard_distance if diversity_metric == 'jaccard' else sorensen_distance
+        
+        # -----------------------------------------------------------------
+        # COMPUTE PAIRWISE DISTANCES
+        # -----------------------------------------------------------------
+        all_cells = list(grid_species.keys())
+        distances = []
+        
+        print(f"  Computing pairwise distances...")
+        for i, cell_a in enumerate(all_cells):
+            for cell_b in all_cells[i + 1:]:
+                d = distance_func(grid_species[cell_a], grid_species[cell_b])
+                distances.append(d)
+        
+        # Calculate statistics
+        if len(distances) > 0:
+            distances_arr = np.array(distances)
+            mean_distance = float(np.mean(distances_arr))
+            std_distance = float(np.std(distances_arr))
+            min_distance = float(np.min(distances_arr))
+            max_distance = float(np.max(distances_arr))
+        else:
+            mean_distance = std_distance = min_distance = max_distance = 0.0
+        
+        # Count cells with biology
+        n_cells_with_biology = sum(1 for species_set in grid_species.values() if len(species_set) > 0)
+        
+        # -----------------------------------------------------------------
+        # INTERPRETATION
+        # -----------------------------------------------------------------
+        if mean_distance < 0.2:
+            interpretation = "Community stable: high species consistency across site"
+        elif mean_distance < 0.5:
+            interpretation = "Moderate turnover: gradual species composition change"
+        else:
+            interpretation = "High turnover: strong community drift across site"
+        
+        # Prepare per-cell species dict for output
+        per_cell_species_dict = {
+            f"({i},{j})": list(species_set)
+            for (i, j), species_set in grid_species.items()
+        }
+        
+        results = {
+            'diversity_metric': diversity_metric,
+            'mean_distance': mean_distance,
+            'std_distance': std_distance,
+            'min_distance': min_distance,
+            'max_distance': max_distance,
+            'grid_size': grid_size,
+            'n_cells_analyzed': grid_size * grid_size,
+            'n_cells_with_biology': n_cells_with_biology,
+            'per_cell_species': per_cell_species_dict,
+            'interpretation': interpretation
+        }
+        
+        print(f"  → Mean distance ({diversity_metric}): {mean_distance:.4f}")
+        print(f"  → Cells with biology: {n_cells_with_biology}/{grid_size * grid_size}")
+        print(f"  → Interpretation: {interpretation}")
+        
+        return results
+    
+    def calculate_projected_biological_loss(
+        self,
+        mining_polygon: Polygon,
+        buffer_distance_m: float = 5.0
+    ) -> Dict[str, Any]:
+        """
+        Calculate Projected Biological Loss - The Impact Simulation Metric.
+        
+        This metric simulates the ecological impact of a mining operation by
+        identifying which biological organisms would be directly killed (within
+        mining footprint) or indirectly affected (within buffer zone).
+        
+        Method:
+            1. Use mining_polygon.within() to find organisms in direct footprint
+            2. Create buffer zone around mining polygon
+            3. Use intersects() to find organisms in indirect impact zone
+            4. Sum casualties by class
+        
+        Args:
+            mining_polygon: Shapely Polygon representing the mining operation footprint.
+            buffer_distance_m: Buffer zone distance in meters (default: 5.0).
+                              Organisms in buffer treated as indirectly affected.
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - 'mining_polygon_area_m2': Area of mining footprint
+                - 'buffer_distance_m': Buffer distance applied
+                - 'direct_casualties': Organisms directly killed
+                  - 'count': Total count
+                  - 'area_m2': Total area (if applicable)
+                  - 'by_class': {'class_name': {'count': int, 'area_m2': float}, ...}
+                - 'indirect_casualties': Organisms indirectly affected
+                  - 'count': Total count
+                  - 'area_m2': Total area
+                  - 'by_class': {...}
+                - 'total_impact': Summary of all casualties
+                  - 'count': Total organisms impacted
+                  - 'area_m2': Total area impacted
+        
+        Raises:
+            ValueError: If geojson_path was not provided.
+            ValueError: If mining_polygon is invalid or empty.
+        
+        Example:
+            >>> from shapely.geometry import Polygon
+            >>> analyzer = SpatialMetricsAnalyzer(geojson_path="fauna.geojson")
+            >>> mining_zone = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+            >>> impact = analyzer.calculate_projected_biological_loss(
+            ...     mining_polygon=mining_zone,
+            ...     buffer_distance_m=10
+            ... )
+            >>> print(f"Direct casualties: {impact['direct_casualties']['count']}")
+        
+        Note:
+            This is a **deterministic simulation** using strict geometric criteria.
+            Real-world impacts may be more complex (e.g., partial mortality,
+            recovery rates). Use as a baseline worst-case scenario.
+        """
+        print(f"\n[METRIC] Calculating Projected Biological Loss...")
+        print(f"  Mining footprint area: {mining_polygon.area * (self.meters_per_pixel ** 2):.2f} m²")
+        print(f"  Buffer distance: {buffer_distance_m} m")
+        
+        # Validate mining polygon
+        if mining_polygon is None or mining_polygon.is_empty:
+            print("[WARNING] Invalid or empty mining polygon")
+            return {
+                'mining_polygon_area_m2': 0.0,
+                'buffer_distance_m': buffer_distance_m,
+                'direct_casualties': {
+                    'count': 0,
+                    'area_m2': 0.0,
+                    'by_class': {}
+                },
+                'indirect_casualties': {
+                    'count': 0,
+                    'area_m2': 0.0,
+                    'by_class': {}
+                },
+                'total_impact': {
+                    'count': 0,
+                    'area_m2': 0.0
+                }
+            }
+        
+        # Load polygons with class labels
+        polygons_by_class = self._load_polygons_with_classes()
+        
+        if not polygons_by_class:
+            print("[WARNING] No biological polygons found")
+            return {
+                'mining_polygon_area_m2': mining_polygon.area * (self.meters_per_pixel ** 2),
+                'buffer_distance_m': buffer_distance_m,
+                'direct_casualties': {
+                    'count': 0,
+                    'area_m2': 0.0,
+                    'by_class': {}
+                },
+                'indirect_casualties': {
+                    'count': 0,
+                    'area_m2': 0.0,
+                    'by_class': {}
+                },
+                'total_impact': {
+                    'count': 0,
+                    'area_m2': 0.0
+                }
+            }
+        
+        # -----------------------------------------------------------------
+        # CREATE HAZARD BUFFER
+        # -----------------------------------------------------------------
+        buffer_pixels = buffer_distance_m / self.meters_per_pixel
+        hazard_zone = mining_polygon.buffer(buffer_pixels)
+        
+        # -----------------------------------------------------------------
+        # FIND DIRECT AND INDIRECT CASUALTIES
+        # -----------------------------------------------------------------
+        direct_casualties = {
+            'count': 0,
+            'area_m2': 0.0,
+            'by_class': {}
+        }
+        
+        indirect_casualties = {
+            'count': 0,
+            'area_m2': 0.0,
+            'by_class': {}
+        }
+        
+        pixel_area_m2 = self.meters_per_pixel ** 2
+        
+        print(f"  Analyzing casualties...")
+        for class_name, polys in tqdm(polygons_by_class.items(), desc="Class analysis", unit="class"):
+            direct_casualties['by_class'][class_name] = {'count': 0, 'area_m2': 0.0}
+            indirect_casualties['by_class'][class_name] = {'count': 0, 'area_m2': 0.0}
+            
+            for poly in polys:
+                poly_area_m2 = poly.area * pixel_area_m2
+                
+                # Direct casualties (within mining footprint)
+                if poly.within(mining_polygon):
+                    direct_casualties['count'] += 1
+                    direct_casualties['area_m2'] += poly_area_m2
+                    direct_casualties['by_class'][class_name]['count'] += 1
+                    direct_casualties['by_class'][class_name]['area_m2'] += poly_area_m2
+                
+                # Indirect casualties (within buffer but not in footprint)
+                elif poly.intersects(hazard_zone):
+                    indirect_casualties['count'] += 1
+                    indirect_casualties['area_m2'] += poly_area_m2
+                    indirect_casualties['by_class'][class_name]['count'] += 1
+                    indirect_casualties['by_class'][class_name]['area_m2'] += poly_area_m2
+        
+        # -----------------------------------------------------------------
+        # COMPUTE TOTALS
+        # -----------------------------------------------------------------
+        total_impact = {
+            'count': direct_casualties['count'] + indirect_casualties['count'],
+            'area_m2': direct_casualties['area_m2'] + indirect_casualties['area_m2']
+        }
+        
+        results = {
+            'mining_polygon_area_m2': mining_polygon.area * pixel_area_m2,
+            'buffer_distance_m': buffer_distance_m,
+            'direct_casualties': direct_casualties,
+            'indirect_casualties': indirect_casualties,
+            'total_impact': total_impact
+        }
+        
+        print(f"  → Direct casualties: {direct_casualties['count']} organisms, "
+              f"{direct_casualties['area_m2']:.2f} m²")
+        print(f"  → Indirect casualties: {indirect_casualties['count']} organisms, "
+              f"{indirect_casualties['area_m2']:.2f} m²")
+        print(f"  → Total impact: {total_impact['count']} organisms, "
+              f"{total_impact['area_m2']:.2f} m²")
+        
+        return results
+    
     # =========================================================================
     # REPORT GENERATION
     # =========================================================================
@@ -1868,6 +2987,14 @@ class SpatialMetricsAnalyzer:
             ('clark_evans', self.calculate_clark_evans, False, True, False),
             ('protrusion', self.calculate_protrusion, True, False, True),
             ('rugosity_3d', self.calculate_3d_rugosity, True, False, True),
+            ('exposed_volume', self.calculate_exposed_volume, True, False, True),
+            ('embedment_angle', self.calculate_embedment_angle, True, False, True),
+            ('sediment_scour_anisotropy', lambda: self.calculate_sediment_scour_anisotropy(ring_width_pixels=5),
+             True, False, True),
+            ('bivariate_ripleys_k', lambda: self.calculate_bivariate_ripleys_k('nodule', 'organism'),
+             False, True, False),
+            ('beta_diversity_turnover', lambda: self.calculate_beta_diversity_turnover(grid_size=4),
+             False, True, False),
         ]
         
         # Run feasible metrics

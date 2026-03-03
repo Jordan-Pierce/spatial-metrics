@@ -1,7 +1,5 @@
 # **Spatial Metrics for optical (and acoustic?) data**
 
-## [**Literature Review**](https://app.undermind.ai/report/0df0c798973a0130d2f8ef070bc47f663bd95600ed915dc0fec53c4ed8e2c5ca)
-
 ## **Prerequisites**
 
 Many of the metrics listed below have specific requirements for the imagery data used, including:
