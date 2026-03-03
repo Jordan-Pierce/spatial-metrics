@@ -250,6 +250,11 @@ class SpatialMetricsAnalyzer:
         
         Raises:
             ValueError: If elevation_path was not provided.
+        
+        Note:
+            Elevation and mask may have different pixel dimensions as long as they
+            cover the same geographic area. Use _resample_elevation_to_mask() when
+            pixel-wise alignment is required.
         """
         if self._elevation_data is not None:
             return self._elevation_data
@@ -268,6 +273,43 @@ class SpatialMetricsAnalyzer:
         
         print(f"[INFO] Elevation loaded: shape={self._elevation_data.shape}")
         return self._elevation_data
+    
+    def _resample_elevation_to_mask(self, elevation: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        Resample elevation raster to match mask dimensions using bilinear interpolation.
+        
+        This allows elevation and mask to cover the same geographic area at different
+        resolutions. The elevation will be resampled to match the mask's pixel grid.
+        
+        Args:
+            elevation: Source elevation array (H1 x W1)
+            mask: Target mask array (H2 x W2)
+        
+        Returns:
+            np.ndarray: Resampled elevation array with shape matching mask (H2 x W2)
+        
+        Note:
+            Uses scipy.ndimage.zoom with bilinear interpolation. NaN values are
+            preserved during resampling.
+        """
+        if elevation.shape == mask.shape:
+            return elevation  # Already aligned, no resampling needed
+        
+        from scipy.ndimage import zoom
+        
+        # Calculate zoom factors for each dimension
+        zoom_factors = (
+            mask.shape[0] / elevation.shape[0],
+            mask.shape[1] / elevation.shape[1]
+        )
+        
+        print(f"[INFO] Resampling elevation from {elevation.shape} to {mask.shape} "
+              f"(zoom factors: {zoom_factors[0]:.3f}, {zoom_factors[1]:.3f})")
+        
+        # Resample using bilinear interpolation (order=1)
+        resampled = zoom(elevation, zoom_factors, order=1, mode='nearest')
+        
+        return resampled
     
     def _load_polygons(self) -> List[Polygon]:
         """
@@ -1370,11 +1412,9 @@ class SpatialMetricsAnalyzer:
         elevation = self._load_elevation()
         mask = self._load_mask()
         
-        # Ensure same shape
-        if elevation.shape != mask.shape:
-            raise ValueError(
-                f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
-            )
+        # Resample elevation to match mask dimensions if needed
+        # (They may cover the same geographic area at different resolutions)
+        elevation = self._resample_elevation_to_mask(elevation, mask)
         
         # Identify sediment (substrate) and object pixels
         # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms
@@ -1841,10 +1881,8 @@ class SpatialMetricsAnalyzer:
         elevation = self._load_elevation()
         mask = self._load_mask()
         
-        if elevation.shape != mask.shape:
-            raise ValueError(
-                f"Elevation shape {elevation.shape} does not match mask shape {mask.shape}"
-            )
+        # Resample elevation to match mask dimensions if needed
+        elevation = self._resample_elevation_to_mask(elevation, mask)
         
         # -----------------------------------------------------------------
         # EXTRACT PERIMETER PIXELS
