@@ -20,7 +20,8 @@ from matplotlib.colors import hsv_to_rgb, Normalize, LinearSegmentedColormap
 from matplotlib.cm import ScalarMappable
 import matplotlib.ticker as mticker
 import rasterio
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
+from shapely.ops import unary_union
 from scipy import ndimage
 from scipy.spatial import KDTree
 from pathlib import Path
@@ -1401,6 +1402,193 @@ class SpatialMetricsVisualizer:
 
         return self._render_and_save('obb_directionality', plot_obb)
 
+    def visualize_bivariate_ripleys_k(self, class_a: str = 'nodule', class_b: str = 'organism', 
+                                      halo_expansion_factor: float = 10.0) -> Dict[str, str]:
+        """
+        Visualize the Bivariate Ripley's K (Invisible Halo).
+
+        Produces the 2D Rule-of-Three suite (clean, overlay, combined) showing
+        resource polygons, biological points, and the invisible halo at the
+        peak radius from the Ripley's K analysis. Also saves a standalone
+        Ripley's K curve image and an interpretive legend image.
+
+        Args:
+            halo_expansion_factor: multiplicative factor applied to the detected
+                peak halo radius. This affects both the drawn halo (buffers/circles)
+                and the dependent-point classification (points within the effective
+                halo are marked dependent). Must be >= 0.0. When 1.0 the behaviour
+                is unchanged from previous versions.
+        """
+        print("\n[VIS] Generating Bivariate Ripley's K visualization...")
+
+        results = self.analyzer.calculate_bivariate_ripleys_k(class_a=class_a, class_b=class_b)
+        radii = np.asarray(results.get('radii_m', []))
+        observed = np.asarray(results.get('observed_counts', []))
+        expected = np.asarray(results.get('expected_poisson_counts', []))
+
+        if radii.size == 0 or observed.size == 0:
+            print("[WARNING] No Ripley's K results available; skipping bivariate viz.")
+            return {}
+
+        # Compute peak halo radius in meters as the radius maximizing (observed - expected)
+        diff = observed - expected
+        if np.all(np.isnan(diff)) or diff.size == 0:
+            idx_peak = int(np.argmax(observed)) if observed.size > 0 else 0
+        else:
+            idx_peak = int(np.nanargmax(diff))
+        r_peak_m = float(radii[idx_peak])
+
+        meters_per_px = float(self.analyzer.meters_per_pixel or 1.0)
+
+        # Colours/style
+        resource_face = (0.05, 0.45, 0.45, 0.35)
+        resource_edge = (0.05, 0.45, 0.45, 0.9)
+        dependent_color = '#3DDC84'
+        independent_color = '#8B949E'
+        halo_color = (1.0, 0.45, 0.05, 0.25)
+
+        # Load polygons grouped by class
+        polys_by_class = self.analyzer._load_polygons_with_classes()
+        class_a_polys = polys_by_class.get(class_a, [])
+        class_b_polys = polys_by_class.get(class_b, [])
+
+        # Compute centroids in pixel coords (original GeoJSON stores pixel-space coords)
+        centroids_a_px = np.array([[p.centroid.x, p.centroid.y] for p in class_a_polys]) if len(class_a_polys) > 0 else np.zeros((0, 2))
+        centroids_b_px = np.array([[p.centroid.x, p.centroid.y] for p in class_b_polys]) if len(class_b_polys) > 0 else np.zeros((0, 2))
+
+        # Convert centroids to meters for plotting (overlay extent uses meters)
+        centroids_a_m = centroids_a_px * meters_per_px
+        centroids_b_m = centroids_b_px * meters_per_px
+
+        # Validate and compute effective halo radius influenced by user-provided factor
+        try:
+            halo_expansion_factor = float(halo_expansion_factor)
+        except Exception:
+            print(f"[WARNING] halo_expansion_factor={halo_expansion_factor!r} is not numeric; using 1.0")
+            halo_expansion_factor = 1.0
+        if halo_expansion_factor < 0.0:
+            print(f"[WARNING] halo_expansion_factor={halo_expansion_factor:.3f} is negative; clamping to 0.0")
+            halo_expansion_factor = 0.0
+
+        # Effective radius used for drawing buffers and classifying dependent points
+        r_effective_m = max(0.0, float(r_peak_m) * float(halo_expansion_factor))
+
+        # KDTree for fast inside-halo testing (use meters)
+        if centroids_a_m.shape[0] > 0 and centroids_b_m.shape[0] > 0:
+            tree_a = KDTree(centroids_a_m)
+            dists_b_to_a, _ = tree_a.query(centroids_b_m, k=1)
+            dependent_mask = dists_b_to_a <= r_effective_m
+        else:
+            dependent_mask = np.zeros(len(centroids_b_m), dtype=bool)
+
+        # Prepare unified buffer polygon for overlay mode (use meters)
+        buffer_union = None
+        try:
+            points = [Point(xy) for xy in centroids_a_m]
+            buffers = [pt.buffer(r_effective_m) for pt in points]
+            if len(buffers) > 0:
+                buffer_union = unary_union(buffers)
+        except Exception:
+            buffer_union = None
+
+        # Define plotting callback
+        def plot_bivariate(ax: plt.Axes, mode: str) -> None:
+            # Draw resource polygons (muted)
+            for poly in class_a_polys:
+                coords_m = np.array(poly.exterior.coords) * meters_per_px
+                patch = mpatches.Polygon(coords_m, fill=True,
+                                         facecolor=resource_face,
+                                         edgecolor=resource_edge, linewidth=0.6)
+                ax.add_patch(patch)
+
+            # Draw halos or unified buffer
+            if mode == 'clean':
+                # Per-resource translucent circles (use effective radius)
+                for (cx_m, cy_m) in centroids_a_m:
+                    c = mpatches.Circle((cx_m, cy_m), r_effective_m,
+                                         facecolor=halo_color, edgecolor=(1.0, 0.45, 0.05, 0.9), linewidth=0.6)
+                    ax.add_patch(c)
+            else:
+                # Overlay: draw unified buffer polygon if available
+                if buffer_union is not None and not buffer_union.is_empty:
+                    if buffer_union.geom_type == 'Polygon':
+                        polys = [buffer_union]
+                    else:
+                        polys = list(buffer_union.geoms)
+                    for bp in polys:
+                        coords = np.array(bp.exterior.coords)
+                        ax.add_patch(mpatches.Polygon(coords, fill=True, facecolor=halo_color, edgecolor='none'))
+
+            # Draw class B points, bright if dependent else muted
+            for i, (bx_m, by_m) in enumerate(centroids_b_m):
+                is_dep = bool(dependent_mask[i]) if i < len(dependent_mask) else False
+                col = dependent_color if is_dep else independent_color
+                ax.plot(bx_m, by_m, marker='o', markersize=4 if is_dep else 3,
+                        color=col, alpha=0.95 if is_dep else 0.6, markeredgewidth=0.0)
+
+            # Small title (report peak radius; effective halo used for drawing/classification)
+            ax.set_title(f'Bivariate Ripley\'s K: {class_b} around {class_a} (r_peak={r_peak_m:.2f} m)')
+
+        # Render clean/overlay/combined images
+        output_paths = self._render_and_save('bivariate_ripleys_k', plot_bivariate)
+
+        # Save Ripley's K curve as separate image
+        try:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3.5), dpi=self.figure_dpi)
+            ax.plot(radii, observed, color='#3DDC84', linewidth=2.0, label='Observed')
+            ax.plot(radii, expected, color='#FF6B6B', linestyle='--', linewidth=1.6, label='Expected (Poisson)')
+            ax.axvline(r_peak_m, color='#FFA500', linestyle=':', linewidth=1.4)
+            ax.set_xlabel('Radius (m)')
+            ax.set_ylabel('Counts')
+            ax.set_xscale('log')
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.18)
+            curve_path = self.output_dir / 'bivariate_ripleys_k_curve.png'
+            plt.tight_layout()
+            plt.savefig(curve_path, dpi=self.figure_dpi, bbox_inches='tight')
+            plt.close(fig)
+            output_paths['curve'] = str(curve_path)
+        except Exception as e:
+            print(f"[WARNING] Failed to save Ripley's K curve: {e}")
+
+        # Save interpretive legend
+        try:
+            fig = plt.figure(figsize=(4, 3), dpi=self.figure_dpi)
+            ax = fig.add_subplot(111)
+            ax.axis('off')
+            interp = results.get('interpretation', '')
+            n_a = results.get('n_class_a', 0)
+            n_b = results.get('n_class_b', 0)
+            txt = (
+                f"{interp}\n\nClass A ({class_a}): {n_a}\nClass B ({class_b}): {n_b}\n"
+                f"Halo radius: {r_effective_m:.2f} m (peak: {r_peak_m:.2f} m, factor: {halo_expansion_factor:.2f})"
+            )
+            ax.text(0.01, 0.98, txt, va='top', ha='left', fontsize=9)
+
+            # Color swatches
+            sw_y = 0.22
+            ax.add_patch(
+                mpatches.Rectangle((0.01, sw_y), 0.08, 0.06, facecolor=resource_face, transform=ax.transAxes)
+            )
+            ax.text(0.11, sw_y + 0.02, 'Resource polygon', transform=ax.transAxes, fontsize=8)
+            ax.add_patch(
+                mpatches.Rectangle((0.01, sw_y - 0.10), 0.08, 0.06, facecolor=halo_color, transform=ax.transAxes)
+            )
+            ax.text(0.11, sw_y - 0.08, 'Invisible Halo (buffer)', transform=ax.transAxes, fontsize=8)
+            ax.add_patch(
+                mpatches.Rectangle((0.01, sw_y - 0.20), 0.08, 0.06, facecolor=dependent_color, transform=ax.transAxes)
+            )
+            ax.text(0.11, sw_y - 0.18, 'Dependent point (inside halo)', transform=ax.transAxes, fontsize=8)
+
+            legend_path = self.output_dir / 'bivariate_ripleys_k_legend.png'
+            plt.savefig(legend_path, dpi=self.figure_dpi, bbox_inches='tight')
+            plt.close(fig)
+            output_paths['legend'] = str(legend_path)
+        except Exception as e:
+            print(f"[WARNING] Failed to save bivariate legend: {e}")
+
+        return output_paths
+
     def _save_legends(self) -> Dict[str, str]:
         """Iterate self._legend_specs and save a small image per metric showing only the colorbar.
 
@@ -1635,6 +1823,13 @@ def visualize_all_metrics(
     except Exception as e:
         print(f"[ERROR] OBB visualization failed: {e}")
         results['obb_directionality'] = None
+
+    # Bivariate Ripley's K (Invisible Halo)
+    try:
+        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    except Exception as e:
+        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+        results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     try:
