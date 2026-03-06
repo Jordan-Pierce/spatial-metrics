@@ -12,6 +12,12 @@ Date: March 2026
 """
 
 import numpy as np
+import matplotlib
+# Force the non-interactive Agg backend before importing pyplot.
+# This prevents Jupyter / IPython from ever trying to inline-display a
+# partially-constructed figure when an exception is raised mid-render.
+# All output goes through explicit savefig() calls; no display is needed.
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
@@ -381,6 +387,54 @@ class SpatialMetricsVisualizer:
         ax.set_zlabel('Elevation (meters)')
         return ax
     
+    def _prepare_axis_overlay_downsampled(self, ax: plt.Axes, max_px: int = 512) -> plt.Axes:
+        """
+        Prepare axis with a downsampled orthomosaic background for low-res figures.
+
+        ``_prepare_axis_overlay`` passes the full-resolution orthomosaic array
+        directly to ``ax.imshow``.  Matplotlib's Agg renderer must allocate a
+        pixel buffer at least as large as the source array *before* it can
+        rescale it to the figure canvas, so even a 96-DPI figure will crash if
+        the orthomosaic is, say, 8000×6000 px (≈ 576 MB for float32 RGB).
+
+        This helper strides the orthomosaic down to at most ``max_px`` pixels on
+        its longest edge before calling ``imshow``, keeping the Agg allocation
+        well within a few MB regardless of the original image size.  The world-
+        coordinate extent is preserved identically so metric geometry still
+        aligns correctly.
+
+        Args:
+            ax:     Matplotlib Axes to configure.
+            max_px: Maximum edge length (pixels) of the downsampled image
+                    passed to imshow (default 512).
+
+        Returns:
+            plt.Axes: Configured axis with downsampled orthomosaic displayed,
+                      or clean white background if orthomosaic_array is None.
+        """
+        if self.orthomosaic_array is None:
+            return self._prepare_axis_clean(ax)
+
+        height, width = self.orthomosaic_array.shape[:2]
+        stride = max(1, int(np.ceil(max(height, width) / max_px)))
+        img = self.orthomosaic_array[::stride, ::stride]
+
+        max_x = width * self.analyzer.meters_per_pixel
+        max_y = height * self.analyzer.meters_per_pixel
+        extent = [0, max_x, max_y, 0]
+
+        if img.ndim == 2:
+            ax.imshow(img, cmap='gray', origin='upper', extent=extent)
+        else:
+            ax.imshow(img, origin='upper', extent=extent)
+
+        ax.set_xlim(0, max_x)
+        ax.set_ylim(max_y, 0)
+        ax.set_aspect('equal')
+        ax.set_xlabel('X (meters)')
+        ax.set_ylabel('Y (meters)')
+        return ax
+
     def _calculate_safe_stride(self, array_shape: Tuple[int, int], max_dimension: int = 2500) -> int:
         """
         Calculate fail-safe decimation stride to prevent 3D rendering crashes.
@@ -424,42 +478,114 @@ class SpatialMetricsVisualizer:
                  'combined': 'path/to/metric_combined.png'}
         """
         output_paths = {}
-        
+
         # 1. STANDALONE CLEAN
         fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
-        self._prepare_axis_clean(ax)
-        plot_func(ax, 'clean')
-        clean_path = self.output_dir / f"{metric_name}_clean.png"
-        plt.savefig(clean_path, dpi=self.figure_dpi, bbox_inches='tight')
-        output_paths['clean'] = str(clean_path)
-        plt.close(fig)
-        
+        try:
+            self._prepare_axis_clean(ax)
+            plot_func(ax, 'clean')
+            clean_path = self.output_dir / f"{metric_name}_clean.png"
+            plt.savefig(clean_path, dpi=self.figure_dpi, bbox_inches='tight')
+            output_paths['clean'] = str(clean_path)
+        finally:
+            plt.close(fig)
+
         # 2. STANDALONE OVERLAY
         fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
-        self._prepare_axis_overlay(ax)
-        plot_func(ax, 'overlay')
-        overlay_path = self.output_dir / f"{metric_name}_overlay.png"
-        plt.savefig(overlay_path, dpi=self.figure_dpi, bbox_inches='tight')
-        output_paths['overlay'] = str(overlay_path)
-        plt.close(fig)
-        
+        try:
+            self._prepare_axis_overlay(ax)
+            plot_func(ax, 'overlay')
+            overlay_path = self.output_dir / f"{metric_name}_overlay.png"
+            plt.savefig(overlay_path, dpi=self.figure_dpi, bbox_inches='tight')
+            output_paths['overlay'] = str(overlay_path)
+        finally:
+            plt.close(fig)
+
         # 3. COMBINED SUBPLOT (1x2)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(self.figure_size[0]*2, self.figure_size[1]), dpi=self.figure_dpi)
-        self._prepare_axis_clean(ax1)
-        plot_func(ax1, 'clean')
-        ax1.set_title(f'{metric_name} (Clean)', fontsize=14, fontweight='bold')
-        
-        self._prepare_axis_overlay(ax2)
-        plot_func(ax2, 'overlay')
-        ax2.set_title(f'{metric_name} (Overlay)', fontsize=14, fontweight='bold')
-        
-        combined_path = self.output_dir / f"{metric_name}_combined.png"
-        plt.savefig(combined_path, dpi=self.figure_dpi, bbox_inches='tight')
-        output_paths['combined'] = str(combined_path)
-        plt.close(fig)
-        
+        try:
+            self._prepare_axis_clean(ax1)
+            plot_func(ax1, 'clean')
+            ax1.set_title(f'{metric_name} (Clean)', fontsize=14, fontweight='bold')
+            self._prepare_axis_overlay(ax2)
+            plot_func(ax2, 'overlay')
+            ax2.set_title(f'{metric_name} (Overlay)', fontsize=14, fontweight='bold')
+            combined_path = self.output_dir / f"{metric_name}_combined.png"
+            plt.savefig(combined_path, dpi=self.figure_dpi, bbox_inches='tight')
+            output_paths['combined'] = str(combined_path)
+        finally:
+            plt.close(fig)
+
         return output_paths
-    
+
+    def _render_and_save_low_res(
+        self,
+        metric_name: str,
+        plot_func: Callable[[plt.Axes, str], None],
+        dpi: int = 96,
+        figsize: Tuple[int, int] = (6, 5),
+    ) -> Dict[str, str]:
+        """
+        Low-memory rendering engine for coarse grid-cell overview figures.
+
+        Identical contract to _render_and_save but uses a small DPI and compact
+        figure size so figures that only need to show low-resolution grid cells
+        (quadrat choropleth, KDE heatmap) never trigger memory allocation failures.
+
+        The default dpi=96 at figsize=(6,5) produces a ~576×480 px canvas — large
+        enough to read cell annotations but orders of magnitude smaller than the
+        ~7200×3000 px canvas that _render_and_save would create at 300 DPI.
+
+        Args:
+            metric_name: Base name for output filenames.
+            plot_func:   Callback with signature plot_func(ax, mode: str).
+            dpi:         Raster resolution (default 96).
+            figsize:     Figure dimensions in inches (default (6, 5)).
+
+        Returns:
+            Dict[str, str]: {'clean': ..., 'overlay': ..., 'combined': ...}
+        """
+        output_paths = {}
+
+        # 1. STANDALONE CLEAN
+        fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=dpi)
+        try:
+            self._prepare_axis_clean(ax)
+            plot_func(ax, 'clean')
+            clean_path = self.output_dir / f"{metric_name}_clean.png"
+            plt.savefig(clean_path, dpi=dpi, bbox_inches='tight')
+            output_paths['clean'] = str(clean_path)
+        finally:
+            plt.close(fig)
+
+        # 2. STANDALONE OVERLAY — downsampled background to avoid Agg buffer OOM
+        fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=dpi)
+        try:
+            self._prepare_axis_overlay_downsampled(ax)
+            plot_func(ax, 'overlay')
+            overlay_path = self.output_dir / f"{metric_name}_overlay.png"
+            plt.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
+            output_paths['overlay'] = str(overlay_path)
+        finally:
+            plt.close(fig)
+
+        # 3. COMBINED SUBPLOT (1x2) — keep combined figure compact too
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(figsize[0] * 2, figsize[1]), dpi=dpi)
+        try:
+            self._prepare_axis_clean(ax1)
+            plot_func(ax1, 'clean')
+            ax1.set_title(f'{metric_name} (Clean)', fontsize=11, fontweight='bold')
+            self._prepare_axis_overlay_downsampled(ax2)
+            plot_func(ax2, 'overlay')
+            ax2.set_title(f'{metric_name} (Overlay)', fontsize=11, fontweight='bold')
+            combined_path = self.output_dir / f"{metric_name}_combined.png"
+            plt.savefig(combined_path, dpi=dpi, bbox_inches='tight')
+            output_paths['combined'] = str(combined_path)
+        finally:
+            plt.close(fig)
+
+        return output_paths
+
     def _render_and_save_3d_suite(
         self,
         metric_name: str,
@@ -741,149 +867,6 @@ class SpatialMetricsVisualizer:
 
         return self._render_and_save('passability_index', plot_passability)
 
-    def visualize_spatial_homogeneity(self, grid_size: Optional[int] = None, 
-                                      target_cell_size_m: float = 5) -> Dict[str, str]:
-        """
-        Visualize spatial homogeneity as a tiled choropleth (quadrats) with counts.
-        Produces clean / overlay / combined figures and a separate homogeneity stats PNG.
-        
-        Args:
-            grid_size: Number of grid cells per dimension. If None, computed from bounds
-                       and target_cell_size_m to ensure cells are approximately target_cell_size_m meters.
-            target_cell_size_m: Target cell size in meters (default: 0.5) when grid_size is None.
-        """
-        # Compute grid_size from bounds if not provided
-        if grid_size is None:
-            polygons = self.analyzer._load_polygons()
-            if len(polygons) > 0:
-                centroids = np.array([[p.centroid.x, p.centroid.y] for p in polygons])
-                min_x, min_y = centroids.min(axis=0)
-                max_x, max_y = centroids.max(axis=0)
-                buffer = 0.001 * max(max_x - min_x, max_y - min_y)
-                min_x -= buffer
-                min_y -= buffer
-                max_x += buffer
-                max_y += buffer
-                width_m = max_x - min_x
-                height_m = max_y - min_y
-                # Compute grid_size to achieve target cell size
-                grid_size = max(1, int(np.ceil(max(width_m, height_m) / target_cell_size_m)))
-            else:
-                grid_size = 4  # Fallback default
-        
-        results = self.analyzer.calculate_spatial_homogeneity(grid_size=grid_size)
-        matrix = np.array(results.get('cell_counts_matrix'))
-        extent = results.get('extent', None)
-
-        if extent is None:
-            polys = self.analyzer._load_polygons()
-            centroids = np.array([[p.centroid.x, p.centroid.y] for p in polys])
-            min_x, min_y = centroids.min(axis=0)
-            max_x, max_y = centroids.max(axis=0)
-            extent = (min_x, max_x, min_y, max_y)
-
-        min_x, max_x, min_y, max_y = extent
-
-        def plot_hom(ax: plt.Axes, mode: str):
-            nrows, ncols = matrix.shape
-            img_extent = (min_x, max_x, min_y, max_y)
-            im = ax.imshow(matrix, cmap='viridis', extent=img_extent, origin='lower')
-
-            cell_w = (max_x - min_x) / ncols
-            cell_h = (max_y - min_y) / nrows
-            for i in range(nrows):
-                for j in range(ncols):
-                    x = min_x + (j + 0.5) * cell_w
-                    y = min_y + (i + 0.5) * cell_h
-                    val = int(matrix[i, j])
-                    txt_color = 'white' if matrix[i, j] > (matrix.max() * 0.5) else 'black'
-                    ax.text(x, y, f"{val}", ha='center', va='center', color=txt_color, fontsize=10, weight='bold')
-
-            if mode == 'overlay':
-                im.set_alpha(0.45)
-
-            sm = ScalarMappable(cmap='viridis')
-            sm.set_array(matrix)
-            plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04, label='Count')
-
-        output = self._render_and_save('spatial_homogeneity', plot_hom)
-
-        fig = plt.figure(figsize=(4, 3), dpi=self.figure_dpi)
-        ax = fig.add_subplot(111)
-        ax.hist(results['cell_counts'], bins=range(int(max(results['cell_counts']) + 2)), color='#4B8BBE', edgecolor='black')
-        ax.set_xlabel('Count per cell')
-        ax.set_ylabel('Frequency')
-        ax.set_title('Quadrat Count Distribution')
-
-        vmr = results.get('vmr', 0.0)
-        pattern = results.get('pattern', '').upper()
-        txt = f"VMR = {vmr:.2f}\n{pattern}"
-        fig.text(0.75, 0.6, txt, fontsize=18, fontweight='bold', ha='center', va='center')
-        out_path = self.output_dir / 'homogeneity_stats.png'
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
-        plt.close(fig)
-        self._inset_specs['spatial_homogeneity'] = {'type': 'hist', 'file': str(out_path)}
-
-        return output
-
-    def visualize_resource_density(self, bandwidth_m: float = 0.5, contour_levels: Optional[List[float]] = None) -> Dict[str, str]:
-        """
-        Visualize resource density (KDE heatmap) with optional contour lines and an external legend.
-        """
-        density, extent = self.analyzer._get_density_map(bandwidth_m=bandwidth_m)
-        min_x, max_x, min_y, max_y = extent
-
-        if contour_levels is None:
-            contour_levels = [5.0, 10.0, 15.0]
-
-        def plot_kde(ax: plt.Axes, mode: str):
-            im = ax.imshow(density, cmap='magma', extent=(min_x, max_x, min_y, max_y), origin='lower')
-            try:
-                cs = ax.contour(np.linspace(min_x, max_x, density.shape[1]),
-                                np.linspace(min_y, max_y, density.shape[0]),
-                                density, levels=contour_levels, colors='white', linewidths=0.8, alpha=0.6)
-            except Exception:
-                pass
-
-            if mode == 'clean':
-                polys = self.analyzer._load_polygons()
-                if len(polys) > 0:
-                    centroids = np.array([[p.centroid.x, p.centroid.y] for p in polys])
-                    ax.scatter(centroids[:, 0], centroids[:, 1], c='white', s=4, alpha=0.9)
-
-            if mode == 'overlay':
-                im.set_alpha(0.6)
-
-            sm = ScalarMappable(cmap='magma')
-            sm.set_array(density)
-            plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04, label='Objects per m²')
-
-        output = self._render_and_save('resource_density', plot_kde)
-
-        fig = plt.figure(figsize=(2.5, 6), dpi=self.figure_dpi)
-        ax = fig.add_axes([0.05, 0.05, 0.4, 0.9])
-        cmap = plt.get_cmap('magma')
-        vmin = float(np.nanmin(density))
-        vmax = float(np.nanmax(density))
-        norm = Normalize(vmin=vmin, vmax=vmax)
-        cb = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=ax)
-        cb.set_label('Objects per m²')
-
-        avg_density = float(np.nanmean(density))
-        max_density = float(np.nanmax(density))
-        survey_area = (max_x - min_x) * (max_y - min_y)
-        fig.text(0.6, 0.8, f"Avg: {avg_density:.2f} /m²", fontsize=10)
-        fig.text(0.6, 0.7, f"Max: {max_density:.2f} /m²", fontsize=10)
-        fig.text(0.6, 0.6, f"Area: {survey_area:.1f} m²", fontsize=10)
-
-        out_path = self.output_dir / 'density_legend.png'
-        plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
-        plt.close(fig)
-        self._legend_specs['resource_density'] = {'file': str(out_path), 'label': 'Objects per m²'}
-
-        return output
-
     def visualize_solidity_rugosity(self, n_exemplars: int = 4, padding_fraction: float = 0.2) -> Dict[str, str]:
         """
         Visualize polygon solidity/rugosity through exemplar zoom-in grid.
@@ -1034,39 +1017,43 @@ class SpatialMetricsVisualizer:
         
         # 1. Standalone Clean Grid
         fig, axes = plt.subplots(2, 2, figsize=self.figure_size, dpi=self.figure_dpi)
-        for ax, idx in zip(axes.flatten(), self._exemplar_indices):
-            draw_cell(ax, polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
-        plt.tight_layout()
-        clean_path = self.output_dir / "solidity_rugosity_clean.png"
-        plt.savefig(clean_path, dpi=self.figure_dpi)
-        output_paths['clean'] = str(clean_path)
-        plt.close(fig)
+        try:
+            for ax, idx in zip(axes.flatten(), self._exemplar_indices):
+                draw_cell(ax, polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
+            plt.tight_layout()
+            clean_path = self.output_dir / "solidity_rugosity_clean.png"
+            plt.savefig(clean_path, dpi=self.figure_dpi)
+            output_paths['clean'] = str(clean_path)
+        finally:
+            plt.close(fig)
 
         # 2. Standalone Overlay Grid
         fig, axes = plt.subplots(2, 2, figsize=self.figure_size, dpi=self.figure_dpi)
-        for ax, idx in zip(axes.flatten(), self._exemplar_indices):
-            draw_cell(ax, polygons[idx], morphology_df.iloc[idx]['solidity'], 'overlay')
-        plt.tight_layout()
-        overlay_path = self.output_dir / "solidity_rugosity_overlay.png"
-        plt.savefig(overlay_path, dpi=self.figure_dpi)
-        output_paths['overlay'] = str(overlay_path)
-        plt.close(fig)
+        try:
+            for ax, idx in zip(axes.flatten(), self._exemplar_indices):
+                draw_cell(ax, polygons[idx], morphology_df.iloc[idx]['solidity'], 'overlay')
+            plt.tight_layout()
+            overlay_path = self.output_dir / "solidity_rugosity_overlay.png"
+            plt.savefig(overlay_path, dpi=self.figure_dpi)
+            output_paths['overlay'] = str(overlay_path)
+        finally:
+            plt.close(fig)
 
         # 3. Combined Grid (Rows = Exemplars, Col1 = Clean, Col2 = Overlay)
         fig, axes = plt.subplots(len(self._exemplar_indices), 
                                  2, 
                                  figsize=(10, 4 * len(self._exemplar_indices)), 
                                  dpi=self.figure_dpi)
-        
-        for row_idx, idx in enumerate(self._exemplar_indices):
-            draw_cell(axes[row_idx, 0], polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
-            draw_cell(axes[row_idx, 1], polygons[idx], morphology_df.iloc[idx]['solidity'], 'overlay')
-        
-        plt.tight_layout()
-        combined_path = self.output_dir / "solidity_rugosity_combined.png"
-        plt.savefig(combined_path, dpi=self.figure_dpi)
-        output_paths['combined'] = str(combined_path)
-        plt.close(fig)
+        try:
+            for row_idx, idx in enumerate(self._exemplar_indices):
+                draw_cell(axes[row_idx, 0], polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
+                draw_cell(axes[row_idx, 1], polygons[idx], morphology_df.iloc[idx]['solidity'], 'overlay')
+            plt.tight_layout()
+            combined_path = self.output_dir / "solidity_rugosity_combined.png"
+            plt.savefig(combined_path, dpi=self.figure_dpi)
+            output_paths['combined'] = str(combined_path)
+        finally:
+            plt.close(fig)
 
         return output_paths
     
@@ -1615,27 +1602,344 @@ class SpatialMetricsVisualizer:
 
         return self._render_and_save('obb_directionality', plot_obb)
 
-    def visualize_bivariate_ripleys_k(self, class_a: str = 'nodule', class_b: str = 'organism', 
-                                      halo_expansion_factor: float = 10.0) -> Dict[str, str]:
+    # =========================================================================
+    # RESOURCE DISTRIBUTION SUITE
+    # =========================================================================
+
+    def visualize_spatial_homogeneity(self, grid_size: int = 4) -> Dict[str, str]:
+        """
+        Visualize Spatial Homogeneity via a Quadrat Choropleth map.
+
+        Produces three low-resolution figures (clean, overlay, combined) showing
+        object count per grid cell coloured with the ``viridis`` colormap.  Each
+        cell is annotated with its raw integer count.  In overlay mode the tile
+        layer is drawn at alpha=0.45 so the seafloor texture remains visible.
+
+        A standalone ``homogeneity_stats.png`` is also saved containing a
+        histogram of quadrat counts and a stylised VMR / pattern label.
+
+        Uses _render_and_save_low_res to avoid memory allocation failures: at
+        the default 96 DPI the combined canvas is ~1152×480 px rather than the
+        ~7200×3000 px that the standard 300-DPI renderer would produce.
+
+        Args:
+            grid_size: Number of cells per axis (default 4 → 4×4 = 16 cells).
+
+        Returns:
+            Dict[str, str]: Output paths including 'clean', 'overlay',
+                'combined', and 'stats'.
+        """
+        print("\n[VIS] Generating Spatial Homogeneity (Quadrat Choropleth)...")
+
+        results = self.analyzer.calculate_spatial_homogeneity(grid_size=grid_size)
+        grid = results.get('cell_counts_matrix')
+        if grid is None:
+            counts = results.get('cell_counts', [])
+            n = results.get('grid_size', grid_size)
+            grid = np.array(counts, dtype=float).reshape(n, n) if len(counts) == n * n else np.zeros((n, n))
+        grid = np.asarray(grid, dtype=float)
+        n_rows, n_cols = grid.shape
+
+        extent_world = results.get('extent', None)   # (min_x, max_x, min_y, max_y)
+        vmr = results.get('vmr', 0.0)
+        pattern = results.get('pattern', 'unknown').upper()
+        mean_count = results.get('mean_count', 0.0)
+
+        # Colour normalisation — protect against flat grids
+        vmin_g, vmax_g = float(grid.min()), float(grid.max())
+        if vmax_g == vmin_g:
+            vmax_g = vmin_g + 1.0
+        norm_g = Normalize(vmin=vmin_g, vmax=vmax_g)
+        cmap_g = plt.cm.viridis
+
+        # Register external legend
+        self._legend_specs['spatial_homogeneity'] = {
+            'cmap': cmap_g,
+            'norm': norm_g,
+            'label': 'Objects per quadrat cell',
+            'orientation': 'vertical',
+        }
+
+        def plot_homogeneity(ax: plt.Axes, mode: str) -> None:
+            # Determine plotting extent in world coordinates
+            if extent_world is not None:
+                min_x, max_x, min_y, max_y = extent_world
+                img_extent = [min_x, max_x, max_y, min_y]  # matplotlib imshow extent
+            else:
+                x_min_ax, x_max_ax, y_min_ax, y_max_ax = self._get_axis_limits()
+                min_x, max_x, min_y, max_y = x_min_ax, x_max_ax, y_min_ax, y_max_ax
+                img_extent = [min_x, max_x, max_y, min_y]
+
+            alpha = 0.45 if mode == 'overlay' else 0.90
+            ax.imshow(
+                grid,
+                cmap=cmap_g,
+                norm=norm_g,
+                origin='lower',
+                extent=img_extent,
+                aspect='auto',
+                alpha=alpha,
+                interpolation='nearest',
+                zorder=2,
+            )
+
+            # Cell size in world units
+            cell_w = (max_x - min_x) / n_cols
+            cell_h = (max_y - min_y) / n_rows
+
+            for row_idx in range(n_rows):
+                for col_idx in range(n_cols):
+                    count_val = int(grid[row_idx, col_idx])
+                    cx = min_x + (col_idx + 0.5) * cell_w
+                    # imshow with origin='lower' means row 0 = bottom
+                    cy = min_y + (row_idx + 0.5) * cell_h
+                    bg = cmap_g(norm_g(float(count_val)))
+                    lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+                    txt_color = 'black' if lum > 0.5 else 'white'
+                    ax.text(
+                        cx, cy, str(count_val),
+                        ha='center', va='center',
+                        fontsize=8, fontweight='bold',
+                        color=txt_color, zorder=3,
+                    )
+
+            # Draw grid lines
+            for ci in range(n_cols + 1):
+                ax.axvline(min_x + ci * cell_w, color='white', linewidth=0.5, alpha=0.6, zorder=4)
+            for ri in range(n_rows + 1):
+                ax.axhline(min_y + ri * cell_h, color='white', linewidth=0.5, alpha=0.6, zorder=4)
+
+            ax.set_title(
+                f'Quadrat Analysis ({n_rows}×{n_cols})  VMR={vmr:.2f}  [{pattern}]',
+                fontsize=9,
+            )
+
+        output_paths = self._render_and_save_low_res('spatial_homogeneity', plot_homogeneity)
+
+        # ---- External stats figure ----
+        try:
+            cell_counts_arr = grid.ravel()
+            fig, axes = plt.subplots(1, 2, figsize=(7, 3), dpi=96)
+            fig.patch.set_facecolor('#0D1117')
+
+            # Histogram
+            ax_hist = axes[0]
+            ax_hist.set_facecolor('#161B22')
+            n_bins = max(5, min(grid_size * grid_size // 2, 15))
+            ax_hist.hist(cell_counts_arr, bins=n_bins, color='#3DDC84', edgecolor='#0D1117', alpha=0.85)
+            ax_hist.set_xlabel('Objects per cell', fontsize=9, color='#8B949E')
+            ax_hist.set_ylabel('Frequency', fontsize=9, color='#8B949E')
+            ax_hist.tick_params(colors='#8B949E', labelsize=8)
+            ax_hist.axvline(mean_count, color='#FFA500', linewidth=1.4, linestyle='--', label=f'Mean={mean_count:.1f}')
+            ax_hist.legend(fontsize=8, labelcolor='#8B949E', facecolor='#161B22', edgecolor='#30363D')
+            for sp in ax_hist.spines.values():
+                sp.set_edgecolor('#30363D')
+            ax_hist.set_title('Quadrat count distribution', fontsize=9, color='#C9D1D9')
+
+            # VMR label
+            ax_txt = axes[1]
+            ax_txt.set_facecolor('#0D1117')
+            ax_txt.axis('off')
+            pat_color = {'CLUSTERED': '#FF6B6B', 'UNIFORM': '#3DDC84', 'RANDOM': '#FFA500'}.get(pattern, '#C9D1D9')
+            ax_txt.text(0.5, 0.65, f'VMR = {vmr:.3f}', ha='center', va='center',
+                        fontsize=22, fontweight='bold', color='#C9D1D9', transform=ax_txt.transAxes)
+            ax_txt.text(0.5, 0.32, pattern, ha='center', va='center',
+                        fontsize=18, fontweight='bold', color=pat_color, transform=ax_txt.transAxes)
+            ax_txt.text(0.5, 0.10, f'Mean count/cell: {mean_count:.2f}', ha='center', va='center',
+                        fontsize=9, color='#8B949E', transform=ax_txt.transAxes)
+
+            plt.tight_layout()
+            stats_path = self.output_dir / 'homogeneity_stats.png'
+            plt.savefig(stats_path, dpi=96, bbox_inches='tight')
+            plt.close(fig)
+            output_paths['stats'] = str(stats_path)
+            print(f"  ✓ Saved: {stats_path.name}")
+        except Exception as e:
+            print(f"[WARNING] Failed to save homogeneity_stats.png: {e}")
+
+        return output_paths
+
+    def visualize_resource_density(self, bandwidth_m: float = 0.5) -> Dict[str, str]:
+        """
+        Visualize Resource Density via a KDE heatmap.
+
+        Produces three low-resolution figures (clean, overlay, combined) using
+        the ``magma`` colormap to render a smooth density surface (objects/m²).
+        Topographic contour lines are drawn at 5, 10, and 15 objects/m².
+        In clean mode individual nodule centroids are plotted as tiny white dots.
+
+        A standalone ``density_legend.png`` is saved with a vertical colorbar
+        labelled in objects/m² plus a summary statistics table.
+
+        The KDE grid is capped at MAX_GRID_CELLS=256 per axis to prevent memory
+        allocation failures regardless of image resolution or meters_per_pixel.
+
+        Args:
+            bandwidth_m: Gaussian smoothing radius in meters (default 0.5).
+
+        Returns:
+            Dict[str, str]: Output paths including 'clean', 'overlay',
+                'combined', and 'density_legend'.
+        """
+        print("\n[VIS] Generating Resource Density (KDE Heatmap)...")
+
+        # Hard cap on KDE grid size — these are overview figures only
+        MAX_GRID_CELLS = 256
+
+        density, extent_world = self.analyzer._get_density_map(
+            bandwidth_m=bandwidth_m,
+            output_shape=(MAX_GRID_CELLS, MAX_GRID_CELLS),
+        )
+
+        min_x, max_x, min_y, max_y = extent_world
+        img_extent_mpl = [min_x, max_x, max_y, min_y]   # imshow: [left, right, bottom, top]
+
+        vmax_d = float(np.nanpercentile(density, 99)) if density.size > 0 else 1.0
+        if vmax_d == 0:
+            vmax_d = 1.0
+        norm_d = Normalize(vmin=0, vmax=vmax_d)
+        cmap_d = plt.cm.magma
+
+        # Contour levels in objects/m²
+        contour_levels = [lv for lv in [5, 10, 15] if lv < vmax_d]
+
+        # Centroids for clean-mode dot overlay
+        polygons = self.analyzer._load_polygons()
+        centroids_m = np.array([[p.centroid.x, p.centroid.y] for p in polygons]) if polygons else np.zeros((0, 2))
+
+        # Summary stats
+        avg_density = float(np.nanmean(density))
+        max_density = float(np.nanmax(density))
+        survey_area_m2 = (max_x - min_x) * (max_y - min_y)
+
+        # Register external colorbar legend
+        self._legend_specs['resource_density'] = {
+            'cmap': cmap_d,
+            'norm': norm_d,
+            'label': 'Objects per m²',
+            'orientation': 'vertical',
+        }
+
+        def plot_density(ax: plt.Axes, mode: str) -> None:
+            ax.imshow(
+                density,
+                cmap=cmap_d,
+                norm=norm_d,
+                origin='upper',
+                extent=img_extent_mpl,
+                aspect='auto',
+                alpha=0.55 if mode == 'overlay' else 0.95,
+                interpolation='bilinear',
+                zorder=2,
+            )
+
+            # Contour lines
+            if len(contour_levels) > 0:
+                # Build a meshgrid matching density orientation
+                xs = np.linspace(min_x, max_x, density.shape[1])
+                ys = np.linspace(min_y, max_y, density.shape[0])
+                XX, YY = np.meshgrid(xs, ys)
+                # density is stored origin='upper' (row 0 = max_y), flip for contour alignment
+                ax.contour(
+                    XX, YY, np.flipud(density),
+                    levels=contour_levels,
+                    colors='white',
+                    linewidths=0.6,
+                    alpha=0.55,
+                    zorder=3,
+                )
+
+            # Raw centroid dots in clean mode
+            if mode == 'clean' and centroids_m.shape[0] > 0:
+                ax.scatter(
+                    centroids_m[:, 0], centroids_m[:, 1],
+                    s=1, c='white', alpha=0.35, linewidths=0, zorder=4,
+                )
+
+            ax.set_title(
+                f'Resource Density (KDE, bw={bandwidth_m} m)  '
+                f'avg={avg_density:.2f} obj/m²',
+                fontsize=9,
+            )
+
+        output_paths = self._render_and_save_low_res('resource_density', plot_density)
+
+        # ---- External density legend figure ----
+        try:
+            fig = plt.figure(figsize=(3.5, 5), dpi=96)
+            fig.patch.set_facecolor('#0D1117')
+
+            # Colorbar
+            cax = fig.add_axes([0.30, 0.38, 0.18, 0.52])
+            sm = ScalarMappable(cmap=cmap_d, norm=norm_d)
+            sm.set_array([])
+            cb = fig.colorbar(sm, cax=cax, orientation='vertical')
+            cb.set_label('Objects per m²', fontsize=8, color='#C9D1D9')
+            cb.ax.yaxis.set_tick_params(labelsize=7, colors='#8B949E')
+            cb.outline.set_edgecolor('#30363D')
+
+            # Stats table
+            ax_tbl = fig.add_axes([0.05, 0.04, 0.90, 0.30])
+            ax_tbl.set_facecolor('#161B22')
+            ax_tbl.axis('off')
+            table_data = [
+                ['Avg Density', f'{avg_density:.3f} obj/m²'],
+                ['Max Density', f'{max_density:.3f} obj/m²'],
+                ['Survey Area', f'{survey_area_m2:.2f} m²'],
+                ['N objects', str(len(polygons))],
+            ]
+            tbl = ax_tbl.table(
+                cellText=table_data,
+                colWidths=[0.50, 0.50],
+                cellLoc='left',
+                loc='center',
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8)
+            for (r, c), cell in tbl.get_celld().items():
+                cell.set_facecolor('#161B22')
+                cell.set_edgecolor('#30363D')
+                cell.set_text_props(color='#C9D1D9')
+
+            density_legend_path = self.output_dir / 'density_legend.png'
+            plt.savefig(density_legend_path, dpi=96, bbox_inches='tight')
+            plt.close(fig)
+            output_paths['density_legend'] = str(density_legend_path)
+            print(f"  ✓ Saved: {density_legend_path.name}")
+        except Exception as e:
+            print(f"[WARNING] Failed to save density_legend.png: {e}")
+
+        return output_paths
+
+    def visualize_bivariate_ripleys_k(self, class_a: str = 'nodule', class_b: str = 'organism',
+                                      halo_radii_m: Tuple[float, float, float] = (0.25, 0.50, 1.0)) -> Dict[str, str]:
         """
         Visualize the Bivariate Ripley's K (Invisible Halo).
 
-        Produces the 2D Rule-of-Three suite (clean, overlay, combined) showing
-        resource polygons, biological points, and the invisible halo at the
-        peak radius from the Ripley's K analysis. Also saves a standalone
-        Ripley's K curve image and an interpretive legend image.
+        Three fixed halo rings (default 0.5 m, 1.5 m, 3.0 m) radiate outward from
+        each biological centroid.  Nodule bounding boxes are colour-graded from
+        red → yellow → green → blue based on their distance to the nearest
+        biological, so proximity risk is immediately readable at a glance.
+
+        Visual language:
+          - Halos: three concentric rings at halo_radii_m, brightest/thickest at the
+            innermost boundary, fading outward.  A faint filled disc fills the core.
+          - Nodules: axis-aligned bounding-box rectangle, colour mapped through a
+            red→yellow→green→blue gradient keyed to distance-to-nearest-biological.
+            The outermost halo radius defines the "at-risk" boundary; beyond 2× that
+            radius nodules are rendered in full safe-blue.
+          - Biologicals: bright-green filled bounding-box square, drawn on top.
 
         Args:
-            halo_expansion_factor: multiplicative factor applied to the detected
-                peak halo radius. This affects both the drawn halo (buffers/circles)
-                and the dependent-point classification (points within the effective
-                halo are marked dependent). Must be >= 0.0. When 1.0 the behaviour
-                is unchanged from previous versions.
+            class_a:       Resource class label (default 'nodule').
+            class_b:       Biological class label (default 'organism').
+            halo_radii_m:  Three halo radii in metres, inner to outer
+                           (default (0.5, 1.5, 3.0)).
         """
-        print("\n[VIS] Generating Bivariate Ripley's K visualization...")
+        print("\n[VIS] Generating Bivariate Ripley's K visualization (Invisible Halo)...")
 
         results = self.analyzer.calculate_bivariate_ripleys_k(class_a=class_a, class_b=class_b)
-        radii = np.asarray(results.get('radii_m', []))
+        radii   = np.asarray(results.get('radii_m', []))
         observed = np.asarray(results.get('observed_counts', []))
         expected = np.asarray(results.get('expected_poisson_counts', []))
 
@@ -1643,160 +1947,244 @@ class SpatialMetricsVisualizer:
             print("[WARNING] No Ripley's K results available; skipping bivariate viz.")
             return {}
 
-        # Compute peak halo radius in meters as the radius maximizing (observed - expected)
+        # Peak radius from Ripley's K curve (informational only — halos use fixed radii)
         diff = observed - expected
-        if np.all(np.isnan(diff)) or diff.size == 0:
-            idx_peak = int(np.argmax(observed)) if observed.size > 0 else 0
-        else:
-            idx_peak = int(np.nanargmax(diff))
-        r_peak_m = float(radii[idx_peak])
+        idx_peak  = int(np.nanargmax(diff)) if not np.all(np.isnan(diff)) else int(np.argmax(observed))
+        r_peak_m  = float(radii[idx_peak])
 
         meters_per_px = float(self.analyzer.meters_per_pixel or 1.0)
 
-        # Colours/style
-        resource_face = (0.05, 0.45, 0.45, 0.35)
-        resource_edge = (0.05, 0.45, 0.45, 0.9)
-        dependent_color = '#3DDC84'
-        independent_color = '#8B949E'
-        halo_color = (1.0, 0.45, 0.05, 0.25)
+        # ── Halo ring definitions (inner → outer) ────────────────────────────
+        r_inner, r_mid, r_outer = sorted(float(r) for r in halo_radii_m)
+        halo_rings = [
+            # (radius_m, linewidth, alpha, linestyle)
+            (r_inner, 2.0, 0.75, '-'),
+            (r_mid,   1.4, 0.45, '--'),
+            (r_outer, 1.0, 0.25, ':'),
+        ]
+        halo_ring_color = '#3DDC84'   # bright green
 
-        # Load polygons grouped by class
+        # ── Nodule distance → colour map ─────────────────────────────────────
+        # Red (distance=0) → Yellow → Green → Blue (distance ≥ 2×r_outer)
+        # We build a custom 4-stop LinearSegmentedColormap.
+        nodule_cmap = LinearSegmentedColormap.from_list(
+            'proximity_risk',
+            [(0.00, '#FF2D2D'),   # 0.0  — touching: red
+             (0.25, '#FF9900'),   # 0.25 — inside inner ring: orange
+             (0.50, '#FFE033'),   # 0.5  — between inner and mid: yellow
+             (0.75, '#3DDC84'),   # 0.75 — between mid and outer: green
+             (1.00, '#5BB8F5')],  # 1.0  — beyond outer ring: safe blue
+        )
+        # Normalise: 0 = touching a biological, 1 = 2× outer ring or farther
+        dist_norm_max = r_outer * 2.0
+
+        # ── Biological box style ──────────────────────────────────────────────
+        bio_edge  = '#3DDC84'
+        bio_fill  = (0.24, 0.86, 0.52, 0.20)
+
+        # ── Load polygons ─────────────────────────────────────────────────────
         polys_by_class = self.analyzer._load_polygons_with_classes()
-        class_a_polys = polys_by_class.get(class_a, [])
-        class_b_polys = polys_by_class.get(class_b, [])
+        class_a_polys  = polys_by_class.get(class_a, [])
+        class_b_polys  = polys_by_class.get(class_b, [])
 
-        # Compute centroids in pixel coords (original GeoJSON stores pixel-space coords)
-        centroids_a_px = np.array([[p.centroid.x, p.centroid.y] for p in class_a_polys]) if len(class_a_polys) > 0 else np.zeros((0, 2))
-        centroids_b_px = np.array([[p.centroid.x, p.centroid.y] for p in class_b_polys]) if len(class_b_polys) > 0 else np.zeros((0, 2))
+        def _aabb_m(poly: Polygon) -> Tuple[float, float, float, float]:
+            minx, miny, maxx, maxy = poly.bounds
+            return (minx * meters_per_px,
+                    miny * meters_per_px,
+                    (maxx - minx) * meters_per_px,
+                    (maxy - miny) * meters_per_px)
 
-        # Convert centroids to meters for plotting (overlay extent uses meters)
-        centroids_a_m = centroids_a_px * meters_per_px
-        centroids_b_m = centroids_b_px * meters_per_px
+        # Centroids in metres
+        centroids_b_m = (
+            np.array([[p.centroid.x, p.centroid.y] for p in class_b_polys]) * meters_per_px
+            if class_b_polys else np.zeros((0, 2))
+        )
+        centroids_a_m = (
+            np.array([[p.centroid.x, p.centroid.y] for p in class_a_polys]) * meters_per_px
+            if class_a_polys else np.zeros((0, 2))
+        )
 
-        # Validate and compute effective halo radius influenced by user-provided factor
-        try:
-            halo_expansion_factor = float(halo_expansion_factor)
-        except Exception:
-            print(f"[WARNING] halo_expansion_factor={halo_expansion_factor!r} is not numeric; using 1.0")
-            halo_expansion_factor = 1.0
-        if halo_expansion_factor < 0.0:
-            print(f"[WARNING] halo_expansion_factor={halo_expansion_factor:.3f} is negative; clamping to 0.0")
-            halo_expansion_factor = 0.0
-
-        # Effective radius used for drawing buffers and classifying dependent points
-        r_effective_m = max(0.0, float(r_peak_m) * float(halo_expansion_factor))
-
-        # KDTree for fast inside-halo testing (use meters)
-        if centroids_a_m.shape[0] > 0 and centroids_b_m.shape[0] > 0:
-            tree_a = KDTree(centroids_a_m)
-            dists_b_to_a, _ = tree_a.query(centroids_b_m, k=1)
-            dependent_mask = dists_b_to_a <= r_effective_m
+        # Distance from every nodule centroid to its nearest biological
+        if centroids_b_m.shape[0] > 0 and centroids_a_m.shape[0] > 0:
+            tree_b = KDTree(centroids_b_m)
+            dists_a_to_b, _ = tree_b.query(centroids_a_m, k=1)  # shape (N_nodules,)
         else:
-            dependent_mask = np.zeros(len(centroids_b_m), dtype=bool)
+            dists_a_to_b = np.full(len(class_a_polys), np.inf)
 
-        # Prepare unified buffer polygon for overlay mode (use meters)
-        buffer_union = None
-        try:
-            points = [Point(xy) for xy in centroids_a_m]
-            buffers = [pt.buffer(r_effective_m) for pt in points]
-            if len(buffers) > 0:
-                buffer_union = unary_union(buffers)
-        except Exception:
-            buffer_union = None
+        # Normalised distance [0, 1] for colour lookup
+        norm_dists = np.clip(dists_a_to_b / dist_norm_max, 0.0, 1.0)
 
-        # Define plotting callback
+        # Count nodules inside each halo zone for the title
+        n_inner  = int(np.sum(dists_a_to_b <= r_inner))
+        n_mid    = int(np.sum((dists_a_to_b > r_inner) & (dists_a_to_b <= r_mid)))
+        n_outer  = int(np.sum((dists_a_to_b > r_mid)   & (dists_a_to_b <= r_outer)))
+        n_safe   = int(np.sum(dists_a_to_b > r_outer))
+
+        print(f"  → Halo rings: {r_inner} m / {r_mid} m / {r_outer} m")
+        print(f"  → Nodules — ≤{r_inner}m: {n_inner}  ≤{r_mid}m: {n_mid}  ≤{r_outer}m: {n_outer}  safe: {n_safe}")
+
         def plot_bivariate(ax: plt.Axes, mode: str) -> None:
-            # Draw resource polygons (muted)
-            for poly in class_a_polys:
-                coords_m = np.array(poly.exterior.coords) * meters_per_px
-                patch = mpatches.Polygon(coords_m, fill=True,
-                                         facecolor=resource_face,
-                                         edgecolor=resource_edge, linewidth=0.6)
-                ax.add_patch(patch)
+            # ── 1. Halo rings + core glow (background, drawn first) ───────
+            if centroids_b_m.shape[0] > 0:
+                for (bx, by) in centroids_b_m:
+                    # Faint filled disc spanning the innermost ring
+                    ax.add_patch(mpatches.Circle(
+                        (bx, by), r_inner,
+                        fill=True,
+                        facecolor=(*matplotlib.colors.to_rgb(halo_ring_color), 0.08),
+                        edgecolor='none',
+                        zorder=1,
+                    ))
+                    # Three concentric rings, outer→inner so inner draws on top
+                    for r_ring, lw, alpha, ls in reversed(halo_rings):
+                        ax.add_patch(mpatches.Circle(
+                            (bx, by), r_ring,
+                            fill=False,
+                            edgecolor=halo_ring_color,
+                            linewidth=lw,
+                            alpha=alpha,
+                            linestyle=ls,
+                            zorder=2,
+                        ))
+                    # Radius labels on clean mode (not on overlay to avoid clutter)
+                    if mode == 'clean':
+                        for r_ring, label in zip(
+                            [r_inner, r_mid, r_outer],
+                            [f'{r_inner}m', f'{r_mid}m', f'{r_outer}m'],
+                        ):
+                            ax.text(
+                                bx + r_ring * 0.71, by - r_ring * 0.71,
+                                label,
+                                fontsize=6, color=halo_ring_color, alpha=0.7,
+                                ha='left', va='top', zorder=5,
+                            )
 
-            # Draw halos or unified buffer
-            if mode == 'clean':
-                # Per-resource translucent circles (use effective radius)
-                for (cx_m, cy_m) in centroids_a_m:
-                    c = mpatches.Circle((cx_m, cy_m), r_effective_m,
-                                         facecolor=halo_color, edgecolor=(1.0, 0.45, 0.05, 0.9), linewidth=0.6)
-                    ax.add_patch(c)
-            else:
-                # Overlay: draw unified buffer polygon if available
-                if buffer_union is not None and not buffer_union.is_empty:
-                    if buffer_union.geom_type == 'Polygon':
-                        polys = [buffer_union]
-                    else:
-                        polys = list(buffer_union.geoms)
-                    for bp in polys:
-                        coords = np.array(bp.exterior.coords)
-                        ax.add_patch(mpatches.Polygon(coords, fill=True, facecolor=halo_color, edgecolor='none'))
+            # ── 2. Nodule boxes — colour-graded by distance ───────────────
+            for i, poly in enumerate(class_a_polys):
+                x0, y0, w, h = _aabb_m(poly)
+                nd = float(norm_dists[i]) if i < len(norm_dists) else 1.0
+                edge_rgba = nodule_cmap(nd)
+                fill_rgba = (*edge_rgba[:3], 0.12)
+                lw = 1.6 if nd < 0.5 else 0.9   # thicker border when close
+                ax.add_patch(mpatches.FancyBboxPatch(
+                    (x0, y0), w, h,
+                    boxstyle='square,pad=0',
+                    fill=True,
+                    facecolor=fill_rgba,
+                    edgecolor=edge_rgba,
+                    linewidth=lw,
+                    zorder=3,
+                ))
 
-            # Draw class B points, bright if dependent else muted
-            for i, (bx_m, by_m) in enumerate(centroids_b_m):
-                is_dep = bool(dependent_mask[i]) if i < len(dependent_mask) else False
-                col = dependent_color if is_dep else independent_color
-                ax.plot(bx_m, by_m, marker='o', markersize=4 if is_dep else 3,
-                        color=col, alpha=0.95 if is_dep else 0.6, markeredgewidth=0.0)
+            # ── 3. Biological boxes (top layer) ──────────────────────────
+            for poly in class_b_polys:
+                x0, y0, w, h = _aabb_m(poly)
+                ax.add_patch(mpatches.FancyBboxPatch(
+                    (x0, y0), w, h,
+                    boxstyle='square,pad=0',
+                    fill=True,
+                    facecolor=bio_fill,
+                    edgecolor=bio_edge,
+                    linewidth=1.8,
+                    zorder=4,
+                ))
 
-            # Small title (report peak radius; effective halo used for drawing/classification)
-            ax.set_title(f'Bivariate Ripley\'s K: {class_b} around {class_a} (r_peak={r_peak_m:.2f} m)')
+            # ── 4. Proximity colorbar (inline, right side) ────────────────
+            sm = ScalarMappable(
+                cmap=nodule_cmap,
+                norm=Normalize(vmin=0, vmax=dist_norm_max),
+            )
+            sm.set_array([])
+            cb = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, aspect=25)
+            cb.set_label('Dist. to nearest biological (m)', fontsize=7)
+            cb.ax.tick_params(labelsize=6)
+            # Mark the three ring radii on the colorbar
+            for r_ring, label in zip([r_inner, r_mid, r_outer],
+                                     [f'{r_inner}m', f'{r_mid}m', f'{r_outer}m']):
+                cb.ax.axhline(r_ring, color='white', linewidth=0.8, alpha=0.7)
+                cb.ax.text(1.35, r_ring, label, transform=cb.ax.get_yaxis_transform(),
+                           fontsize=6, va='center', color='white', alpha=0.85)
 
-        # Render clean/overlay/combined images
+            ax.set_title(
+                f'Invisible Halo  |  rings: {r_inner} / {r_mid} / {r_outer} m  |  '
+                f'≤{r_inner}m: {n_inner}  ≤{r_mid}m: {n_mid}  ≤{r_outer}m: {n_outer}  safe: {n_safe}',
+                fontsize=8,
+            )
+
+        # ── Render Rule-of-Three suite ────────────────────────────────────────
         output_paths = self._render_and_save('bivariate_ripleys_k', plot_bivariate)
 
-        # Save Ripley's K curve as separate image
+        # ── Ripley's K curve ──────────────────────────────────────────────────
         try:
             fig, ax = plt.subplots(1, 1, figsize=(6, 3.5), dpi=self.figure_dpi)
-            ax.plot(radii, observed, color='#3DDC84', linewidth=2.0, label='Observed')
-            ax.plot(radii, expected, color='#FF6B6B', linestyle='--', linewidth=1.6, label='Expected (Poisson)')
-            ax.axvline(r_peak_m, color='#FFA500', linestyle=':', linewidth=1.4)
-            ax.set_xlabel('Radius (m)')
-            ax.set_ylabel('Counts')
-            ax.set_xscale('log')
-            ax.legend(fontsize=8)
-            ax.grid(alpha=0.18)
-            curve_path = self.output_dir / 'bivariate_ripleys_k_curve.png'
-            plt.tight_layout()
-            plt.savefig(curve_path, dpi=self.figure_dpi, bbox_inches='tight')
-            plt.close(fig)
-            output_paths['curve'] = str(curve_path)
+            try:
+                ax.plot(radii, observed, color='#3DDC84', linewidth=2.0, label='Observed')
+                ax.plot(radii, expected, color='#FF6B6B', linestyle='--', linewidth=1.6,
+                        label='Expected (Poisson)')
+                ax.axvline(r_peak_m, color='#FFA500', linestyle=':', linewidth=1.4,
+                           label=f'Peak r={r_peak_m:.2f} m')
+                for r_ring, ls, col in zip(
+                    [r_inner, r_mid, r_outer],
+                    ['-', '--', ':'],
+                    ['#FF2D2D', '#FFE033', '#5BB8F5'],
+                ):
+                    ax.axvline(r_ring, color=col, linewidth=0.9, linestyle=ls, alpha=0.6)
+                ax.set_xlabel('Radius (m)')
+                ax.set_ylabel('Counts')
+                ax.set_xscale('log')
+                ax.legend(fontsize=7)
+                ax.grid(alpha=0.18)
+                curve_path = self.output_dir / 'bivariate_ripleys_k_curve.png'
+                plt.tight_layout()
+                plt.savefig(curve_path, dpi=self.figure_dpi, bbox_inches='tight')
+                output_paths['curve'] = str(curve_path)
+            finally:
+                plt.close(fig)
         except Exception as e:
             print(f"[WARNING] Failed to save Ripley's K curve: {e}")
 
-        # Save interpretive legend
+        # ── Interpretive legend ───────────────────────────────────────────────
         try:
-            fig = plt.figure(figsize=(4, 3), dpi=self.figure_dpi)
-            ax = fig.add_subplot(111)
-            ax.axis('off')
-            interp = results.get('interpretation', '')
-            n_a = results.get('n_class_a', 0)
-            n_b = results.get('n_class_b', 0)
-            txt = (
-                f"{interp}\n\nClass A ({class_a}): {n_a}\nClass B ({class_b}): {n_b}\n"
-                f"Halo radius: {r_effective_m:.2f} m (peak: {r_peak_m:.2f} m, factor: {halo_expansion_factor:.2f})"
-            )
-            ax.text(0.01, 0.98, txt, va='top', ha='left', fontsize=9)
+            fig = plt.figure(figsize=(4.5, 4), dpi=self.figure_dpi)
+            try:
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                interp = results.get('interpretation', '')
+                n_a    = results.get('n_class_a', 0)
+                n_b    = results.get('n_class_b', 0)
+                txt = (
+                    f"{interp}\n\n"
+                    f"{class_a.capitalize()}s: {n_a}   {class_b.capitalize()}s: {n_b}\n"
+                    f"Rings: {r_inner} m / {r_mid} m / {r_outer} m\n"
+                    f"Ripley K peak: {r_peak_m:.3f} m\n\n"
+                    f"≤{r_inner}m: {n_inner}  |  ≤{r_mid}m: {n_mid}  |  ≤{r_outer}m: {n_outer}  |  safe: {n_safe}"
+                )
+                ax.text(0.02, 0.98, txt, va='top', ha='left', fontsize=8.5,
+                        transform=ax.transAxes, family='monospace')
 
-            # Color swatches
-            sw_y = 0.22
-            ax.add_patch(
-                mpatches.Rectangle((0.01, sw_y), 0.08, 0.06, facecolor=resource_face, transform=ax.transAxes)
-            )
-            ax.text(0.11, sw_y + 0.02, 'Resource polygon', transform=ax.transAxes, fontsize=8)
-            ax.add_patch(
-                mpatches.Rectangle((0.01, sw_y - 0.10), 0.08, 0.06, facecolor=halo_color, transform=ax.transAxes)
-            )
-            ax.text(0.11, sw_y - 0.08, 'Invisible Halo (buffer)', transform=ax.transAxes, fontsize=8)
-            ax.add_patch(
-                mpatches.Rectangle((0.01, sw_y - 0.20), 0.08, 0.06, facecolor=dependent_color, transform=ax.transAxes)
-            )
-            ax.text(0.11, sw_y - 0.18, 'Dependent point (inside halo)', transform=ax.transAxes, fontsize=8)
+                # Gradient swatch for nodule colour scale
+                grad = np.linspace(0, 1, 256).reshape(1, -1)
+                ax_cb = fig.add_axes([0.05, 0.15, 0.55, 0.06])
+                ax_cb.imshow(grad, aspect='auto', cmap=nodule_cmap, origin='lower')
+                ax_cb.set_yticks([])
+                ax_cb.set_xticks([0, 85, 170, 255])
+                ax_cb.set_xticklabels(['0 m', f'{r_inner}m', f'{r_mid}m', f'{r_outer}m+'], fontsize=7)
+                ax_cb.set_title('Nodule box colour = dist. to nearest biological', fontsize=7, pad=3)
 
-            legend_path = self.output_dir / 'bivariate_ripleys_k_legend.png'
-            plt.savefig(legend_path, dpi=self.figure_dpi, bbox_inches='tight')
-            plt.close(fig)
-            output_paths['legend'] = str(legend_path)
+                # Bio box swatch
+                ax.add_patch(mpatches.Rectangle(
+                    (0.05, 0.05), 0.08, 0.055,
+                    facecolor=bio_fill, edgecolor=bio_edge, linewidth=1.5,
+                    transform=ax.transAxes,
+                ))
+                ax.text(0.16, 0.075, f'{class_b.capitalize()} (biological)',
+                        transform=ax.transAxes, fontsize=8, va='center')
+
+                legend_path = self.output_dir / 'bivariate_ripleys_k_legend.png'
+                plt.savefig(legend_path, dpi=self.figure_dpi, bbox_inches='tight')
+                output_paths['legend'] = str(legend_path)
+            finally:
+                plt.close(fig)
         except Exception as e:
             print(f"[WARNING] Failed to save bivariate legend: {e}")
 
@@ -2043,18 +2431,18 @@ def visualize_all_metrics(
     #     print(f"[ERROR] Solidity visualization failed: {e}")
     #     results['solidity_rugosity'] = None
     
-    try:
-        results['obb_directionality'] = viz.visualize_obb_directionality()
-    except Exception as e:
-        print(f"[ERROR] OBB visualization failed: {e}")
-        results['obb_directionality'] = None
+    # try:
+    #     results['obb_directionality'] = viz.visualize_obb_directionality()
+    # except Exception as e:
+    #     print(f"[ERROR] OBB visualization failed: {e}")
+    #     results['obb_directionality'] = None
 
     # Bivariate Ripley's K (Invisible Halo)
-    # try:
-    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    # except Exception as e:
-    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-    #     results['bivariate_ripleys_k'] = None
+    try:
+        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    except Exception as e:
+        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+        results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     # try:
