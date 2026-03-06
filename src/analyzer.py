@@ -8,11 +8,14 @@ SEMANTIC SEGMENTATION MASK STRUCTURE:
     The analyzer expects semantic segmentation masks with the following class definitions:
     - 0: Background (non-labeled, outside ROI)
     - 1: Substrate/Sediment (navigable surface, reference for metrics)
-    - 2: Nodule (target mining object, obstacle for collision avoidance)
-    - 3: Organisms (living creatures, obstacle to preserve and avoid)
-    
-    Substrate (mask==1) is treated as free/navigable space for passability calculations.
-    Objects (mask>=2) are treated as obstacles in collision avoidance metrics.
+    - 2: Nodule (target mining object; usually passable by the collector)
+    - 3: Organisms (living creatures; obstacles to preserve and avoid)
+    - 4: Obstruction (large, non-passable obstruction such as outcrop or debris)
+
+    For passability calculations the collector is permitted to traverse substrate
+    and nodules (mask == 1 or mask == 2). Organisms (3) and obstructions (4)
+    are treated as obstacles to avoid. Other metrics (morphology, verticality)
+    may still treat nodules as objects of interest (mask == 2).
 
 The metrics are organized into five categories:
     - Density & Abundance: PCF, Resource Density, Spatial Homogeneity
@@ -214,11 +217,12 @@ class SpatialMetricsAnalyzer:
         Mask class definitions:
             - 0: Background (non-labeled, outside ROI)
             - 1: Substrate/Sediment (navigable free space)
-            - 2: Nodule (obstacle, target object for mining)
-            - 3: Organisms (obstacle, living creatures to avoid)
+            - 2: Nodule (target mining object; often traversable)
+            - 3: Organisms (living creatures to avoid)
+            - 4: Obstruction (large non-passable obstacle)
         
         Returns:
-            np.ndarray: Semantic mask array with values in [0, 1, 2, 3].
+            np.ndarray: Semantic mask array with values in [0, 1, 2, 3, 4].
         
         Raises:
             ValueError: If mask_path was not provided.
@@ -876,10 +880,10 @@ class SpatialMetricsAnalyzer:
         mask = self._load_mask()
         
         # Define free space and obstacles based on semantic mask
-        # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms
-        # Free space is substrate (mask == 1)
-        # Obstacles are nodules and organisms (mask >= 2)
-        free_space = (mask == 1).astype(np.float32)
+        # Mask structure: 0=background, 1=substrate, 2=nodule, 3=organisms, 4=obstruction
+        # Free space is substrate AND nodules (mask == 1 | mask == 2)
+        # Obstacles are organisms and obstructions (mask == 3 | mask == 4)
+        free_space = ((mask == 1) | (mask == 2)).astype(np.float32)
         
         # Check if there's any free space
         if np.sum(free_space) == 0:
@@ -892,15 +896,19 @@ class SpatialMetricsAnalyzer:
                 'passability_fraction': 0.0
             }
         
-        # Check if there are any obstacles (nodules or organisms)
-        if np.sum(mask >= 2) == 0:
+        # Check if there are any obstacles (organisms or obstructions)
+        if np.sum((mask == 3) | (mask == 4)) == 0:
             print("[WARNING] No obstacles found in mask - infinite passability")
             diagonal = np.sqrt(mask.shape[0]**2 + mask.shape[1]**2) * self.meters_per_pixel
             return {
-                'max_passage_diameter_m': diagonal,
-                'max_passage_radius_m': diagonal / 2,
-                'mean_clearance_m': diagonal / 2,
-                'median_clearance_m': diagonal / 2,
+                'max_passage_diameter_m': float(diagonal),
+                'max_passage_radius_m': float(diagonal / 2),
+                'max_passage_x_m': 0.0,
+                'max_passage_y_m': 0.0,
+                'max_passage_pixel_row': 0,
+                'max_passage_pixel_col': 0,
+                'mean_clearance_m': float(diagonal / 2),
+                'median_clearance_m': float(diagonal / 2),
                 'passability_fraction': 1.0
             }
         

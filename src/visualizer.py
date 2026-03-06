@@ -666,8 +666,12 @@ class SpatialMetricsVisualizer:
         def plot_passability(ax: plt.Axes, mode: str) -> None:
             """Render passability as traversability corridors with contour bands."""
             mask = self.analyzer._load_mask()
-            sediment_mask = (mask == 1).astype(np.uint8)
-            distance_transform = ndimage.distance_transform_edt(sediment_mask)
+            
+            # Substrate (1) and Nodules (2) are free space for navigation
+            # Organisms (3) and Obstructions (4) are obstacles
+            free_space_mask = ((mask == 1) | (mask == 2)).astype(np.uint8)
+            
+            distance_transform = ndimage.distance_transform_edt(free_space_mask)
             distance_transform_m = distance_transform * self.analyzer.meters_per_pixel
 
             height, width = mask.shape
@@ -685,6 +689,7 @@ class SpatialMetricsVisualizer:
             xs = np.linspace(0, w * self.analyzer.meters_per_pixel, w)
             ys = np.linspace(0, h * self.analyzer.meters_per_pixel, h)
             max_r = float(distance_transform_m[~np.isnan(distance_transform_m)].max())
+            
             # Contour levels at 25 %, 50 %, 75 % of max radius = vehicle size thresholds
             contour_levels = [max_r * f for f in (0.25, 0.50, 0.75) if max_r * f > 0]
             if contour_levels:
@@ -722,13 +727,11 @@ class SpatialMetricsVisualizer:
                                       ec='#FF4B4B', alpha=0.85),
                             zorder=12)
 
-            # Record legend specification for passability (no inline colorbar)
-            self._legend_specs['passability_index'] = {
-                'cmap': plt.cm.magma,
-                'norm': Normalize(vmin=0, vmax=max_r),
-                'label': 'Clearance to nearest obstacle (m)',
-                'orientation': 'vertical'
-            }
+            # --- Colorbar ---
+            cb = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+            cb.set_label('Clearance to nearest obstacle (m)', color='white', fontsize=8)
+            cb.ax.yaxis.set_tick_params(color='#8B949E', labelcolor='#8B949E', labelsize=7)
+            cb.outline.set_edgecolor('#30363D')
 
         return self._render_and_save('passability_index', plot_passability)
 
