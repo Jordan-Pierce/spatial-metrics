@@ -1367,12 +1367,31 @@ class SpatialMetricsVisualizer:
                 pv = np.array([np.cos(rad), np.sin(rad)])
 
                 if mode == 'clean':
-                    # Scale line length to polygon's typical size
-                    poly_extent = max(poly.bounds[2] - poly.bounds[0],
-                                      poly.bounds[3] - poly.bounds[1]) * self.analyzer.meters_per_pixel
-                    half_len = max(poly_extent * 0.6, 0.3)
+                    # Determine a sensible line length from the polygon's OBB
+                    # Prefer OBB side lengths (more representative for elongated shapes)
+                    try:
+                        obb = poly.minimum_rotated_rectangle
+                        if obb.geom_type == 'Polygon':
+                            obb_coords = np.array(obb.exterior.coords)
+                            # Two adjacent sides define the rectangle side lengths
+                            s1 = obb_coords[1] - obb_coords[0]
+                            s2 = obb_coords[2] - obb_coords[1]
+                            side1 = np.linalg.norm(s1) * self.analyzer.meters_per_pixel
+                            side2 = np.linalg.norm(s2) * self.analyzer.meters_per_pixel
+                            obb_long = max(side1, side2)
+                            obb_short = min(side1, side2)
+                            # Use a fraction of the long axis for line length
+                            half_len = max(obb_long * 0.5, 0.3)
+                        else:
+                            raise ValueError("degenerate obb")
+                    except Exception:
+                        # Fallback to polygon bounding box if OBB fails
+                        poly_extent = max(poly.bounds[2] - poly.bounds[0],
+                                          poly.bounds[3] - poly.bounds[1]) * self.analyzer.meters_per_pixel
+                        half_len = max(poly_extent * 0.5, 0.3)
+
                     start = np.array([cx, cy]) - pv * half_len
-                    end   = np.array([cx, cy]) + pv * half_len
+                    end = np.array([cx, cy]) + pv * half_len
                     lines.append([start, end])
                     line_colors.append(color)
                 else:
@@ -1829,11 +1848,11 @@ def visualize_all_metrics(
         results['obb_directionality'] = None
 
     # Bivariate Ripley's K (Invisible Halo)
-    try:
-        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    except Exception as e:
-        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-        results['bivariate_ripleys_k'] = None
+    # try:
+    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    # except Exception as e:
+    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+    #     results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     try:
