@@ -2023,6 +2023,14 @@ class SpatialMetricsVisualizer:
         print(f"  → Halo rings: {r_inner} m / {r_mid} m / {r_outer} m")
         print(f"  → Nodules — ≤{r_inner}m: {n_inner}  ≤{r_mid}m: {n_mid}  ≤{r_outer}m: {n_outer}  safe: {n_safe}")
 
+        # Register external legend (do not draw inline colorbar in figures)
+        self._legend_specs['bivariate_ripleys_k'] = {
+            'cmap': nodule_cmap,
+            'norm': Normalize(vmin=0, vmax=dist_norm_max),
+            'label': 'Dist. to nearest biological (m)',
+            'orientation': 'vertical'
+        }
+
         def plot_bivariate(ax: plt.Axes, mode: str) -> None:
             # ── 1. Halo rings + core glow (background, drawn first) ───────
             if centroids_b_m.shape[0] > 0:
@@ -2089,21 +2097,9 @@ class SpatialMetricsVisualizer:
                     zorder=4,
                 ))
 
-            # ── 4. Proximity colorbar (inline, right side) ────────────────
-            sm = ScalarMappable(
-                cmap=nodule_cmap,
-                norm=Normalize(vmin=0, vmax=dist_norm_max),
-            )
-            sm.set_array([])
-            cb = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, aspect=25)
-            cb.set_label('Dist. to nearest biological (m)', fontsize=7)
-            cb.ax.tick_params(labelsize=6)
-            # Mark the three ring radii on the colorbar
-            for r_ring, label in zip([r_inner, r_mid, r_outer],
-                                     [f'{r_inner}m', f'{r_mid}m', f'{r_outer}m']):
-                cb.ax.axhline(r_ring, color='white', linewidth=0.8, alpha=0.7)
-                cb.ax.text(1.35, r_ring, label, transform=cb.ax.get_yaxis_transform(),
-                           fontsize=6, va='center', color='white', alpha=0.85)
+            # Colourbar/legend are intentionally not drawn inline in the figures.
+            # A separate legend image is saved via the public legend saving utility
+            # (see _save_legends / save_legends) to keep map figures clean.
 
             ax.set_title(
                 f'Invisible Halo  |  rings: {r_inner} / {r_mid} / {r_outer} m  |  '
