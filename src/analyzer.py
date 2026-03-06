@@ -141,6 +141,7 @@ class SpatialMetricsAnalyzer:
         # Cache for loaded data
         self._mask_data: Optional[np.ndarray] = None
         self._elevation_data: Optional[np.ndarray] = None
+        self._elevation_transform: Optional[rasterio.Affine] = None
         self._polygons: Optional[List[Polygon]] = None
         self._raster_shape: Optional[Tuple[int, int]] = None
         self._raster_transform: Optional[rasterio.Affine] = None
@@ -265,12 +266,13 @@ class SpatialMetricsAnalyzer:
         print("[INFO] Loading elevation raster...")
         with rasterio.open(self.elevation_path) as src:
             self._elevation_data = src.read(1).astype(np.float32)
+            self._elevation_transform = src.transform
             
             # Handle nodata values
             nodata = src.nodata
             if nodata is not None:
                 self._elevation_data[self._elevation_data == nodata] = np.nan
-        
+
         print(f"[INFO] Elevation loaded: shape={self._elevation_data.shape}")
         return self._elevation_data
     
@@ -292,23 +294,44 @@ class SpatialMetricsAnalyzer:
             Uses scipy.ndimage.zoom with bilinear interpolation. NaN values are
             preserved during resampling.
         """
-        if elevation.shape == mask.shape:
-            return elevation  # Already aligned, no resampling needed
-        
+        # Delegate to the more general shape-resampling helper
+        return self._resample_elevation_to_shape(elevation, mask.shape)
+
+    def _resample_elevation_to_shape(self, elevation: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Resample elevation array to a given target shape (H, W) using bilinear interpolation.
+
+        Preserves NaN values and prints informative messages about zoom factors.
+        """
+        if elevation.shape == target_shape:
+            return elevation
+
         from scipy.ndimage import zoom
-        
-        # Calculate zoom factors for each dimension
+
         zoom_factors = (
-            mask.shape[0] / elevation.shape[0],
-            mask.shape[1] / elevation.shape[1]
+            target_shape[0] / elevation.shape[0],
+            target_shape[1] / elevation.shape[1]
         )
-        
-        print(f"[INFO] Resampling elevation from {elevation.shape} to {mask.shape} "
+
+        print(f"[INFO] Resampling elevation from {elevation.shape} to {target_shape} "
               f"(zoom factors: {zoom_factors[0]:.3f}, {zoom_factors[1]:.3f})")
-        
-        # Resample using bilinear interpolation (order=1)
-        resampled = zoom(elevation, zoom_factors, order=1, mode='nearest')
-        
+
+        # Use bilinear interpolation (order=1) and preserve NaNs
+        # scipy.ndimage.zoom does not handle NaNs specially; preserve mask
+        nan_mask = np.isnan(elevation)
+
+        # Temporarily fill NaNs with zero to avoid propagation during zoom
+        filled = np.where(nan_mask, 0.0, elevation)
+
+        resampled_filled = zoom(filled, zoom_factors, order=1, mode='nearest')
+
+        # Resample the nan mask using nearest-neighbor to identify NaN regions
+        resampled_mask = zoom(~nan_mask.astype(np.uint8), zoom_factors, order=0, mode='nearest')
+
+        # Where resampled_mask == 0, set NaN
+        resampled = resampled_filled.astype(np.float32)
+        resampled[resampled_mask == 0] = np.nan
+
         return resampled
     
     def _load_polygons(self) -> List[Polygon]:

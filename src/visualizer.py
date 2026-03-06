@@ -184,13 +184,31 @@ class SpatialMetricsVisualizer:
                 if src.nodata is not None:
                     self.elevation_array[self.elevation_array == src.nodata] = np.nan
             
-            # Info message about resolution (no strict validation)
-            if self.orthomosaic_array is not None:
+            # If orthomosaic is available, ensure DEM matches its pixel grid.
+            if self.orthomosaic_array is not None and self.elevation_array is not None:
                 ortho_shape = self.orthomosaic_array.shape[:2]
                 elev_shape = self.elevation_array.shape
                 if elev_shape != ortho_shape:
-                    print(f"[INFO] Elevation resolution ({elev_shape}) differs from "
-                          f"orthomosaic ({ortho_shape}). Both cover same geographic area.")
+                    print(f"[WARNING] Elevation resolution {elev_shape} differs from "
+                          f"orthomosaic {ortho_shape}. Resampling DEM to orthomosaic pixel grid.")
+                    try:
+                        # Use analyzer helper to resample elevation to target shape
+                        self.elevation_array = self.analyzer._resample_elevation_to_shape(
+                            self.elevation_array, ortho_shape
+                        )
+
+                        # After resampling, adopt orthomosaic affine if available so
+                        # that subsequent world<->pixel conversions align to the
+                        # orthomosaic pixel grid used for plotting.
+                        if self.affine_transform is not None:
+                            self.elevation_transform = self.affine_transform
+                        else:
+                            # Fall back to original elevation transform if present
+                            self.elevation_transform = self.elevation_transform
+
+                        print(f"[INFO] Elevation resampled: new shape={self.elevation_array.shape}")
+                    except Exception as e:
+                        print(f"[WARNING] Resampling elevation failed: {e}. Continuing with original DEM shape.")
             
             print(f"[INFO] Elevation loaded: shape={self.elevation_array.shape}")
             print("[INFO] ASSUMPTION: Elevation units are METERS (matching XY scale)")
@@ -350,7 +368,7 @@ class SpatialMetricsVisualizer:
         ax.set_zlabel('Elevation (meters)')
         return ax
     
-    def _calculate_safe_stride(self, array_shape: Tuple[int, int], max_dimension: int = 500) -> int:
+    def _calculate_safe_stride(self, array_shape: Tuple[int, int], max_dimension: int = 1500) -> int:
         """
         Calculate fail-safe decimation stride to prevent 3D rendering crashes.
         
@@ -360,15 +378,10 @@ class SpatialMetricsVisualizer:
         
         Args:
             array_shape: Shape of elevation array (height, width)
-            max_dimension: Maximum allowed pixels per edge after decimation (default: 500)
+            max_dimension: Maximum allowed pixels per edge after decimation (default: 1500)
         
         Returns:
             int: Stride value (minimum 1) to use in array[::stride, ::stride]
-        
-        Example:
-            >>> # 4000x3000 array with max_dimension=500
-            >>> stride = _calculate_safe_stride((4000, 3000), 500)
-            >>> # Returns 8, yielding 500x375 decimated array
         """
         max_edge = max(array_shape)
         stride = max(1, int(np.ceil(max_edge / max_dimension)))
@@ -1050,7 +1063,7 @@ class SpatialMetricsVisualizer:
             # Isolate slope values at perimeter pixels only
             perimeter_slopes = np.where(perimeter_mask, slope_degrees, np.nan)
             
-            extent = [0, mask.shape[1] * meters_per_px, mask.shape[0] * meters_per_px, 0]
+            extent = [0, mask.shape[1] * meters_per_px, mask.shape[0] * meters_per_pixel, 0]
             
             # Reversed Red-Yellow-Green: intuitive traffic light metaphor
             im = ax.imshow(
