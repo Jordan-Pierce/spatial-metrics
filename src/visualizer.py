@@ -824,13 +824,58 @@ class SpatialMetricsVisualizer:
             if contour_levels:
                 cs = ax.contour(xs, ys, distance_transform_m,
                                 levels=contour_levels, origin='upper',
-                                colors=['#39D0D8', '#F0A500', '#3DDC84'],
+                                colors=['#FF4B4B', '#FFD33D', '#3DDC84'],
                                 linewidths=[0.9, 1.1, 1.3], alpha=0.85)
                 contour_labels = [f'{v:.2f} m' for v in contour_levels]
                 fmt = {lvl: lbl for lvl, lbl in zip(cs.levels, contour_labels)}
                 ax.clabel(cs, fmt=fmt, fontsize=7, colors='white', inline=True, inline_spacing=4)
 
                 # (Maximum inscribed circle visualization removed)
+
+            # --- Polygon overlays: draw annotated polygons on top of the heatmap ---
+            try:
+                # Prefer loading polygons with class labels when available
+                polygons_by_class = None
+                try:
+                    polygons_by_class = self.analyzer._load_polygons_with_classes()
+                except Exception:
+                    polygons_by_class = None
+
+                if polygons_by_class:
+                    # Draw polygons class-aware
+                    for cls_name, poly_list in polygons_by_class.items():
+                        cls_lower = (cls_name or '').lower()
+                        is_bad = ('organ' in cls_lower) or ('obstruct' in cls_lower) or ('obstr' in cls_lower)
+                        for poly in poly_list:
+                            try:
+                                coords_m = np.array(poly.exterior.coords) * self.analyzer.meters_per_pixel
+                            except Exception:
+                                continue
+                            edge_col = '#FF4B4B' if is_bad else '#3DDC84'
+                            lw = 0.9 if is_bad else 0.7
+                            alpha_poly = 0.95 if mode == 'clean' else 0.9
+                            patch = mpatches.Polygon(coords_m, fill=False,
+                                                     edgecolor=edge_col, linewidth=lw,
+                                                     alpha=alpha_poly, zorder=6)
+                            ax.add_patch(patch)
+                else:
+                    # Fallback: draw unlabelled polygons in green
+                    polygons = self.analyzer._load_polygons()
+                    for poly in polygons:
+                        try:
+                            coords_m = np.array(poly.exterior.coords) * self.analyzer.meters_per_pixel
+                        except Exception:
+                            continue
+                        edge_col = '#3DDC84'
+                        lw = 0.7
+                        alpha_poly = 0.9
+                        patch = mpatches.Polygon(coords_m, fill=False,
+                                                 edgecolor=edge_col, linewidth=lw,
+                                                 alpha=alpha_poly, zorder=6)
+                        ax.add_patch(patch)
+            except Exception:
+                # Non-fatal: polygon plotting is best-effort
+                pass
 
             # Colourbar/legend should not be drawn inline — record a legend spec
             # so a separate legend image can be saved later via _save_legends().
