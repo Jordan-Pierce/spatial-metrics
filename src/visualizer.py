@@ -777,16 +777,13 @@ class SpatialMetricsVisualizer:
     def visualize_passability_index(self) -> Dict[str, str]:
         """
         Visualize passability index (navigable corridors for collection vehicles).
-        
+
         Generates three figures showing where collection vehicles can navigate without
         colliding with objects. Displays a 2D distance transform heatmap (distance to
-        nearest obstacle) with the maximum inscribed circle highlighted in red.
-        
-        Circle is now drawn at exact location of largest passage, not at
-        random center position. Location is calculated automatically from distance transform.
-        
+        nearest obstacle).
+
         Figures:
-        - Clean: Distance heatmap with colorbar and maximum circle
+        - Clean: Distance heatmap (colorbar saved separately)
         - Overlay: Same heatmap over orthomosaic (semi-transparent)
         - Combined: 1x2 subplot for comparison
         
@@ -833,37 +830,20 @@ class SpatialMetricsVisualizer:
                 fmt = {lvl: lbl for lvl, lbl in zip(cs.levels, contour_labels)}
                 ax.clabel(cs, fmt=fmt, fontsize=7, colors='white', inline=True, inline_spacing=4)
 
-            # --- Maximum inscribed circle ---
-            if metric_results.get('max_passage_radius_m', 0) > 0:
-                max_idx = np.unravel_index(np.argmax(distance_transform), distance_transform.shape)
-                max_y_m = max_idx[0] * self.analyzer.meters_per_pixel
-                max_x_m = max_idx[1] * self.analyzer.meters_per_pixel
-                max_r_m = float(distance_transform_m.max())
+                # (Maximum inscribed circle visualization removed)
 
-                circle = mpatches.Circle((max_x_m, max_y_m), max_r_m,
-                                         fill=True, facecolor=(1, 0.29, 0.29, 0.10),
-                                         edgecolor='#FF4B4B', linewidth=2.0, zorder=10)
-                ax.add_patch(circle)
-                # Cross-hair at centre
-                clen = max_r_m * 0.18
-                ax.plot([max_x_m - clen, max_x_m + clen], [max_y_m, max_y_m],
-                        color='#FF4B4B', linewidth=1.2, zorder=11)
-                ax.plot([max_x_m, max_x_m], [max_y_m - clen, max_y_m + clen],
-                        color='#FF4B4B', linewidth=1.2, zorder=11)
-                ax.annotate(f'Max clearance\n{max_r_m:.2f} m radius',
-                            xy=(max_x_m, max_y_m + max_r_m),
-                            xytext=(max_x_m, max_y_m + max_r_m * 1.35),
-                            fontsize=8, color='#FF4B4B', ha='center',
-                            arrowprops=dict(arrowstyle='->', color='#FF4B4B', lw=1.0),
-                            bbox=dict(boxstyle='round,pad=0.3', fc='#0D1117',
-                                      ec='#FF4B4B', alpha=0.85),
-                            zorder=12)
-
-            # --- Colorbar ---
-            cb = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-            cb.set_label('Clearance to nearest obstacle (m)', color='white', fontsize=8)
-            cb.ax.yaxis.set_tick_params(color='#8B949E', labelcolor='#8B949E', labelsize=7)
-            cb.outline.set_edgecolor('#30363D')
+            # Colourbar/legend should not be drawn inline — record a legend spec
+            # so a separate legend image can be saved later via _save_legends().
+            try:
+                self._legend_specs['passability_index'] = {
+                    'cmap': plt.cm.magma,
+                    'norm': Normalize(vmin=0.0, vmax=max_r if max_r > 0 else 1.0),
+                    'label': 'Clearance to nearest obstacle (m)',
+                    'orientation': 'vertical'
+                }
+            except Exception:
+                # Best-effort; do not break rendering if normalization fails
+                pass
 
         return self._render_and_save('passability_index', plot_passability)
 
@@ -2403,11 +2383,11 @@ def visualize_all_metrics(
     #     print(f"[ERROR] NND visualization failed: {e}")
     #     results['nearest_neighbor_distance'] = None
     
-    # try:
-    #     results['passability_index'] = viz.visualize_passability_index()
-    # except Exception as e:
-    #     print(f"[ERROR] Passability visualization failed: {e}")
-    #     results['passability_index'] = None
+    try:
+        results['passability_index'] = viz.visualize_passability_index()
+    except Exception as e:
+        print(f"[ERROR] Passability visualization failed: {e}")
+        results['passability_index'] = None
 
     # try:
     #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
@@ -2434,11 +2414,11 @@ def visualize_all_metrics(
     #     results['obb_directionality'] = None
 
     # Bivariate Ripley's K (Invisible Halo)
-    try:
-        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    except Exception as e:
-        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-        results['bivariate_ripleys_k'] = None
+    # try:
+    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    # except Exception as e:
+    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+    #     results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     # try:
