@@ -559,22 +559,24 @@ class SpatialMetricsVisualizer:
         Returns:
             Dict[str, str]: Output file paths {'clean': ..., 'overlay': ..., 'combined': ...}
         """
-        metric_results = self.analyzer.calculate_nearest_neighbor_distance(method='edge')
+        # Prefer analyzer-provided cached nearest-neighbour results (default method='edge')
+        nnd_cache = self.analyzer.get_nearest_neighbor_data(method='edge', recompute=False)
+        metric_results = nnd_cache.get('metrics') if isinstance(nnd_cache.get('metrics'), dict) else self.analyzer.calculate_nearest_neighbor_distance(method='edge')
 
-        # Pre-compute true nearest-neighbor pairs via KDTree on centroids (fast proxy for viz)
         polygons_all = self.analyzer._load_polygons()
-        centroids = np.array([[p.centroid.x * self.analyzer.meters_per_pixel,
-                                p.centroid.y * self.analyzer.meters_per_pixel]
-                               for p in polygons_all])
-        tree = KDTree(centroids)
-        # For each polygon, find its nearest neighbour centroid index
-        dists_query, idxs_nn = tree.query(centroids, k=2)  # k=2: self + nearest
-        nn_indices = idxs_nn[:, 1]  # index of nearest neighbour for each polygon
 
-        # Per-polygon NND in meters from the pre-computed metric results
-        nnd_values_m = np.array(metric_results.get('nnd_values_m', []))
-        if len(nnd_values_m) != len(polygons_all):
-            # Fallback: use centroid proxy distances
+        # Attempt to use cached arrays (nnd values in meters and nn indices). If cache is missing
+        # or lengths mismatch, fall back to centroid KDTree proxy for visualization.
+        nnd_values_m = np.asarray(nnd_cache.get('nnd_values_m', []))
+        nn_indices = np.asarray(nnd_cache.get('nn_indices', []))
+
+        if nnd_values_m.size != len(polygons_all) or nn_indices.size != len(polygons_all):
+            # Fallback: compute centroid KDTree proxy
+            centroids = np.array([[p.centroid.x * self.analyzer.meters_per_pixel,
+                                   p.centroid.y * self.analyzer.meters_per_pixel]
+                                  for p in polygons_all])
+            dists_query, idxs_nn = KDTree(centroids).query(centroids, k=2)
+            nn_indices = idxs_nn[:, 1]
             nnd_values_m = dists_query[:, 1]
 
         vmin_nnd = np.percentile(nnd_values_m, 5)
@@ -738,6 +740,149 @@ class SpatialMetricsVisualizer:
             cb.outline.set_edgecolor('#30363D')
 
         return self._render_and_save('passability_index', plot_passability)
+
+    def visualize_spatial_homogeneity(self, grid_size: Optional[int] = None, 
+                                      target_cell_size_m: float = 5) -> Dict[str, str]:
+        """
+        Visualize spatial homogeneity as a tiled choropleth (quadrats) with counts.
+        Produces clean / overlay / combined figures and a separate homogeneity stats PNG.
+        
+        Args:
+            grid_size: Number of grid cells per dimension. If None, computed from bounds
+                       and target_cell_size_m to ensure cells are approximately target_cell_size_m meters.
+            target_cell_size_m: Target cell size in meters (default: 0.5) when grid_size is None.
+        """
+        # Compute grid_size from bounds if not provided
+        if grid_size is None:
+            polygons = self.analyzer._load_polygons()
+            if len(polygons) > 0:
+                centroids = np.array([[p.centroid.x, p.centroid.y] for p in polygons])
+                min_x, min_y = centroids.min(axis=0)
+                max_x, max_y = centroids.max(axis=0)
+                buffer = 0.001 * max(max_x - min_x, max_y - min_y)
+                min_x -= buffer
+                min_y -= buffer
+                max_x += buffer
+                max_y += buffer
+                width_m = max_x - min_x
+                height_m = max_y - min_y
+                # Compute grid_size to achieve target cell size
+                grid_size = max(1, int(np.ceil(max(width_m, height_m) / target_cell_size_m)))
+            else:
+                grid_size = 4  # Fallback default
+        
+        results = self.analyzer.calculate_spatial_homogeneity(grid_size=grid_size)
+        matrix = np.array(results.get('cell_counts_matrix'))
+        extent = results.get('extent', None)
+
+        if extent is None:
+            polys = self.analyzer._load_polygons()
+            centroids = np.array([[p.centroid.x, p.centroid.y] for p in polys])
+            min_x, min_y = centroids.min(axis=0)
+            max_x, max_y = centroids.max(axis=0)
+            extent = (min_x, max_x, min_y, max_y)
+
+        min_x, max_x, min_y, max_y = extent
+
+        def plot_hom(ax: plt.Axes, mode: str):
+            nrows, ncols = matrix.shape
+            img_extent = (min_x, max_x, min_y, max_y)
+            im = ax.imshow(matrix, cmap='viridis', extent=img_extent, origin='lower')
+
+            cell_w = (max_x - min_x) / ncols
+            cell_h = (max_y - min_y) / nrows
+            for i in range(nrows):
+                for j in range(ncols):
+                    x = min_x + (j + 0.5) * cell_w
+                    y = min_y + (i + 0.5) * cell_h
+                    val = int(matrix[i, j])
+                    txt_color = 'white' if matrix[i, j] > (matrix.max() * 0.5) else 'black'
+                    ax.text(x, y, f"{val}", ha='center', va='center', color=txt_color, fontsize=10, weight='bold')
+
+            if mode == 'overlay':
+                im.set_alpha(0.45)
+
+            sm = ScalarMappable(cmap='viridis')
+            sm.set_array(matrix)
+            plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04, label='Count')
+
+        output = self._render_and_save('spatial_homogeneity', plot_hom)
+
+        fig = plt.figure(figsize=(4, 3), dpi=self.figure_dpi)
+        ax = fig.add_subplot(111)
+        ax.hist(results['cell_counts'], bins=range(int(max(results['cell_counts']) + 2)), color='#4B8BBE', edgecolor='black')
+        ax.set_xlabel('Count per cell')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Quadrat Count Distribution')
+
+        vmr = results.get('vmr', 0.0)
+        pattern = results.get('pattern', '').upper()
+        txt = f"VMR = {vmr:.2f}\n{pattern}"
+        fig.text(0.75, 0.6, txt, fontsize=18, fontweight='bold', ha='center', va='center')
+        out_path = self.output_dir / 'homogeneity_stats.png'
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
+        plt.close(fig)
+        self._inset_specs['spatial_homogeneity'] = {'type': 'hist', 'file': str(out_path)}
+
+        return output
+
+    def visualize_resource_density(self, bandwidth_m: float = 0.5, contour_levels: Optional[List[float]] = None) -> Dict[str, str]:
+        """
+        Visualize resource density (KDE heatmap) with optional contour lines and an external legend.
+        """
+        density, extent = self.analyzer._get_density_map(bandwidth_m=bandwidth_m)
+        min_x, max_x, min_y, max_y = extent
+
+        if contour_levels is None:
+            contour_levels = [5.0, 10.0, 15.0]
+
+        def plot_kde(ax: plt.Axes, mode: str):
+            im = ax.imshow(density, cmap='magma', extent=(min_x, max_x, min_y, max_y), origin='lower')
+            try:
+                cs = ax.contour(np.linspace(min_x, max_x, density.shape[1]),
+                                np.linspace(min_y, max_y, density.shape[0]),
+                                density, levels=contour_levels, colors='white', linewidths=0.8, alpha=0.6)
+            except Exception:
+                pass
+
+            if mode == 'clean':
+                polys = self.analyzer._load_polygons()
+                if len(polys) > 0:
+                    centroids = np.array([[p.centroid.x, p.centroid.y] for p in polys])
+                    ax.scatter(centroids[:, 0], centroids[:, 1], c='white', s=4, alpha=0.9)
+
+            if mode == 'overlay':
+                im.set_alpha(0.6)
+
+            sm = ScalarMappable(cmap='magma')
+            sm.set_array(density)
+            plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04, label='Objects per m²')
+
+        output = self._render_and_save('resource_density', plot_kde)
+
+        fig = plt.figure(figsize=(2.5, 6), dpi=self.figure_dpi)
+        ax = fig.add_axes([0.05, 0.05, 0.4, 0.9])
+        cmap = plt.get_cmap('magma')
+        vmin = float(np.nanmin(density))
+        vmax = float(np.nanmax(density))
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        cb = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=ax)
+        cb.set_label('Objects per m²')
+
+        avg_density = float(np.nanmean(density))
+        max_density = float(np.nanmax(density))
+        survey_area = (max_x - min_x) * (max_y - min_y)
+        fig.text(0.6, 0.8, f"Avg: {avg_density:.2f} /m²", fontsize=10)
+        fig.text(0.6, 0.7, f"Max: {max_density:.2f} /m²", fontsize=10)
+        fig.text(0.6, 0.6, f"Area: {survey_area:.1f} m²", fontsize=10)
+
+        out_path = self.output_dir / 'density_legend.png'
+        plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
+        plt.close(fig)
+        self._legend_specs['resource_density'] = {'file': str(out_path), 'label': 'Objects per m²'}
+
+        return output
 
     def visualize_solidity_rugosity(self, n_exemplars: int = 4, padding_fraction: float = 0.2) -> Dict[str, str]:
         """
@@ -1320,18 +1465,20 @@ class SpatialMetricsVisualizer:
         polygons_all = self.analyzer._load_polygons()
         angles_deg = []
         for i, poly in enumerate(polygons_all):
-            if i >= len(morphology_df):
-                break
             obb = poly.minimum_rotated_rectangle
             if obb.geom_type != 'Polygon':
                 angles_deg.append(0.0)
                 continue
             obb_coords = np.array(obb.exterior.coords)
+            # Compute vectors along two adjacent OBB sides
             s1 = obb_coords[1] - obb_coords[0]
             s2 = obb_coords[2] - obb_coords[1]
+            # Use longest side vector as principal vector
             pv = s1 if np.linalg.norm(s1) > np.linalg.norm(s2) else s2
+            # Normalize and compute angle
             pv = pv / (np.linalg.norm(pv) + 1e-9)
-            angles_deg.append(np.degrees(np.arctan2(pv[1], pv[0])) % 360)
+            angle_rad = np.arctan2(pv[1], pv[0])
+            angles_deg.append(np.degrees(angle_rad) % 360)
         angles_deg = np.array(angles_deg)
 
         # Legend spec for orientation (cyclic HSV colormap, degrees 0-360)
@@ -1343,73 +1490,105 @@ class SpatialMetricsVisualizer:
         }
 
         def plot_obb(ax: plt.Axes, mode: str) -> None:
-            """Render OBB: polygons + directional lines coloured by orientation + rose inset."""
+            """Render OBB: polygons + directional lines coloured by orientation."""
             polygons = self.analyzer._load_polygons()
             lines, line_colors = [], []
 
             if mode == 'clean':
+                # Add semi-transparent gray polygon backgrounds
                 for poly in polygons:
-                    coords = np.array(poly.exterior.coords) * self.analyzer.meters_per_pixel
-                    ax.add_patch(mpatches.Polygon(coords, fill=True,
-                                                  facecolor=(0.22, 0.82, 0.85, 0.18),
-                                                  edgecolor=(0.22, 0.82, 0.85, 0.45),
-                                                  linewidth=0.4))
+                    coords = (
+                        np.array(poly.exterior.coords) 
+                        * self.analyzer.meters_per_pixel
+                    )
+                    ax.add_patch(
+                        mpatches.Polygon(
+                            coords, 
+                            fill=True,
+                            facecolor=(0.22, 0.82, 0.85, 0.18),
+                            edgecolor=(0.22, 0.82, 0.85, 0.45),
+                            linewidth=0.4
+                        )
+                    )
 
+            # Render directional indicators or OBB rectangles
             for i, poly in enumerate(polygons):
                 if i >= len(morphology_df) or i >= len(angles_deg):
                     continue
+                
                 angle = angles_deg[i]
                 color = hsv_to_rgb([angle / 360.0, 0.85, 0.95])
-
                 cx = morphology_df.iloc[i]['centroid_x_m']
                 cy = morphology_df.iloc[i]['centroid_y_m']
                 rad = np.radians(angle)
                 pv = np.array([np.cos(rad), np.sin(rad)])
 
                 if mode == 'clean':
-                    # Determine a sensible line length from the polygon's OBB
-                    # Prefer OBB side lengths (more representative for elongated shapes)
+                    # Draw directional lines with length = OBB width (shorter dimension)
                     try:
                         obb = poly.minimum_rotated_rectangle
                         if obb.geom_type == 'Polygon':
                             obb_coords = np.array(obb.exterior.coords)
-                            # Two adjacent sides define the rectangle side lengths
                             s1 = obb_coords[1] - obb_coords[0]
                             s2 = obb_coords[2] - obb_coords[1]
-                            side1 = np.linalg.norm(s1) * self.analyzer.meters_per_pixel
-                            side2 = np.linalg.norm(s2) * self.analyzer.meters_per_pixel
-                            obb_long = max(side1, side2)
-                            obb_short = min(side1, side2)
-                            # Use a fraction of the long axis for line length
-                            half_len = max(obb_long * 0.5, 0.3)
+                            side1 = (
+                                np.linalg.norm(s1) 
+                                * self.analyzer.meters_per_pixel
+                            )
+                            side2 = (
+                                np.linalg.norm(s2) 
+                                * self.analyzer.meters_per_pixel
+                            )
+                            # Use shorter dimension (width) for line length
+                            half_len = min(side1, side2) / 2.0
                         else:
                             raise ValueError("degenerate obb")
                     except Exception:
                         # Fallback to polygon bounding box if OBB fails
-                        poly_extent = max(poly.bounds[2] - poly.bounds[0],
-                                          poly.bounds[3] - poly.bounds[1]) * self.analyzer.meters_per_pixel
-                        half_len = max(poly_extent * 0.5, 0.3)
+                        bounds = poly.bounds
+                        extent_x = bounds[2] - bounds[0]
+                        extent_y = bounds[3] - bounds[1]
+                        min_extent = (
+                            min(extent_x, extent_y) 
+                            * self.analyzer.meters_per_pixel
+                        )
+                        half_len = min_extent / 2.0
 
                     start = np.array([cx, cy]) - pv * half_len
                     end = np.array([cx, cy]) + pv * half_len
                     lines.append([start, end])
                     line_colors.append(color)
                 else:
+                    # Overlay mode: draw OBB rectangles colored by angle
                     obb = poly.minimum_rotated_rectangle
                     if obb.geom_type == 'Polygon':
-                        obb_coords_m = np.array(obb.exterior.coords) * self.analyzer.meters_per_pixel
-                        ax.add_patch(mpatches.Polygon(
-                            obb_coords_m, fill=True,
-                            facecolor=(*color, 0.28),
-                            edgecolor=(*color, 0.85), linewidth=1.2))
+                        obb_coords_m = (
+                            np.array(obb.exterior.coords) 
+                            * self.analyzer.meters_per_pixel
+                        )
+                        ax.add_patch(
+                            mpatches.Polygon(
+                                obb_coords_m,
+                                fill=True,
+                                facecolor=(*color, 0.28),
+                                edgecolor=(*color, 0.85),
+                                linewidth=1.2
+                            )
+                        )
 
+            # Add rendered directional lines (clean mode only)
             if mode == 'clean' and lines:
-                ax.add_collection(LineCollection(lines, colors=line_colors,
-                                                 linewidths=1.5, alpha=0.88, zorder=4))
+                ax.add_collection(
+                    LineCollection(
+                        lines,
+                        colors=line_colors,
+                        linewidths=1.5,
+                        alpha=0.88,
+                        zorder=4
+                    )
+                )
 
-            # --- Rose diagram inset ---
-            # Record rose inset data to be saved as a separate image instead of
-            # drawing it inline inside each OBB plot.
+            # Record rose diagram inset for separate rendering
             if len(angles_deg) > 0:
                 self._inset_specs['obb_directionality'] = {
                     'type': 'rose',
@@ -1417,11 +1596,22 @@ class SpatialMetricsVisualizer:
                     'n_bins': 24
                 }
 
-            # Compass label
-            ax.text(0.99, 0.01, '0°→E  ·  90°→N',
-                    transform=ax.transAxes, ha='right', va='bottom',
-                    fontsize=8, color='#8B949E',
-                    bbox=dict(boxstyle='round,pad=0.25', fc='#0D1117', ec='#30363D', alpha=0.8))
+            # Compass orientation label
+            ax.text(
+                0.99, 0.01,
+                '0°→E  ·  90°→N',
+                transform=ax.transAxes,
+                ha='right',
+                va='bottom',
+                fontsize=8,
+                color='#8B949E',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    fc='#0D1117',
+                    ec='#30363D',
+                    alpha=0.8
+                )
+            )
 
         return self._render_and_save('obb_directionality', plot_obb)
 
@@ -1823,23 +2013,35 @@ def visualize_all_metrics(
     print("GENERATING ALL METRIC VISUALIZATIONS")
     print("="*60 + "\n")
     
-    try:
-        results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
-    except Exception as e:
-        print(f"[ERROR] NND visualization failed: {e}")
-        results['nearest_neighbor_distance'] = None
+    # try:
+    #     results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
+    # except Exception as e:
+    #     print(f"[ERROR] NND visualization failed: {e}")
+    #     results['nearest_neighbor_distance'] = None
     
-    try:
-        results['passability_index'] = viz.visualize_passability_index()
-    except Exception as e:
-        print(f"[ERROR] Passability visualization failed: {e}")
-        results['passability_index'] = None
+    # try:
+    #     results['passability_index'] = viz.visualize_passability_index()
+    # except Exception as e:
+    #     print(f"[ERROR] Passability visualization failed: {e}")
+    #     results['passability_index'] = None
+
+    # try:
+    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    # except Exception as e:
+    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+    #     results['spatial_homogeneity'] = None
+
+    # try:
+    #     results['resource_density'] = viz.visualize_resource_density(bandwidth_m=0.5)
+    # except Exception as e:
+    #     print(f"[ERROR] Resource density visualization failed: {e}")
+    #     results['resource_density'] = None
     
-    try:
-        results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
-    except Exception as e:
-        print(f"[ERROR] Solidity visualization failed: {e}")
-        results['solidity_rugosity'] = None
+    # try:
+    #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
+    # except Exception as e:
+    #     print(f"[ERROR] Solidity visualization failed: {e}")
+    #     results['solidity_rugosity'] = None
     
     try:
         results['obb_directionality'] = viz.visualize_obb_directionality()
@@ -1855,17 +2057,17 @@ def visualize_all_metrics(
     #     results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
-    try:
-        results['protrusion'] = viz.visualize_protrusion()
-    except Exception as e:
-        print(f"[ERROR] Protrusion visualization failed: {e}")
-        results['protrusion'] = None
+    # try:
+    #     results['protrusion'] = viz.visualize_protrusion()
+    # except Exception as e:
+    #     print(f"[ERROR] Protrusion visualization failed: {e}")
+    #     results['protrusion'] = None
     
-    try:
-        results['embedment_angle'] = viz.visualize_embedment_angle()
-    except Exception as e:
-        print(f"[ERROR] Embedment Angle visualization failed: {e}")
-        results['embedment_angle'] = None
+    # try:
+    #     results['embedment_angle'] = viz.visualize_embedment_angle()
+    # except Exception as e:
+    #     print(f"[ERROR] Embedment Angle visualization failed: {e}")
+    #     results['embedment_angle'] = None
     
     print("\n" + "="*60)
     print("VISUALIZATION GENERATION COMPLETE")

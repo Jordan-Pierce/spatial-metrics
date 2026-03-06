@@ -158,6 +158,9 @@ class SpatialMetricsAnalyzer:
         self._polygons: Optional[List[Polygon]] = None
         self._raster_shape: Optional[Tuple[int, int]] = None
         self._raster_transform: Optional[rasterio.Affine] = None
+        # Cache for computed nearest-neighbour results keyed by method ('edge' or 'centroid')
+        # Each entry is a dict with keys: 'method','nnd_values_m','nn_indices','centroids_px','centroids_m','metrics'
+        self._cached_nnd: Dict[str, Any] = {}
         
         # Print initialization summary
         print("=" * 60)
@@ -531,6 +534,40 @@ class SpatialMetricsAnalyzer:
         print(f"  → PCF: {pcf_percent:.2f}% ({covered_area_m2:.4f} m² / {total_area_m2:.4f} m²)")
         
         return results
+
+    def get_nearest_neighbor_data(self, method: str = 'edge', recompute: bool = False) -> Dict[str, Any]:
+        """
+        Return cached nearest-neighbour data for given method.
+
+        If not cached or recompute=True, this will compute the metric via
+        `calculate_nearest_neighbor_distance` and populate the cache, then
+        return a dict containing arrays and metrics.
+
+        Returns dict with keys:
+          - 'method'
+          - 'nnd_values_m' (np.ndarray)
+          - 'nn_indices' (list[int])
+          - 'centroids_px' (np.ndarray)
+          - 'centroids_m' (np.ndarray)
+          - 'metrics' (the summary metrics dict returned by calculate_nearest_neighbor_distance)
+        """
+        if method not in ['edge', 'centroid']:
+            raise ValueError("Invalid method for nearest-neighbour data. Use 'edge' or 'centroid'.")
+
+        if (not recompute) and (method in self._cached_nnd):
+            return self._cached_nnd[method]
+
+        # Compute (this will populate the cache)
+        metrics = self.calculate_nearest_neighbor_distance(method=method)
+
+        # Return the cache entry if present
+        return self._cached_nnd.get(method, {'method': method, 'nnd_values_m': np.array([]),
+                                             'nn_indices': [], 'centroids_px': np.zeros((0, 2)),
+                                             'centroids_m': np.zeros((0, 2)), 'metrics': metrics})
+
+    def invalidate_nnd_cache(self) -> None:
+        """Clear any stored nearest-neighbour cache entries."""
+        self._cached_nnd.clear()
     
     def calculate_abundance(self) -> Dict[str, float]:
         """
@@ -682,24 +719,27 @@ class SpatialMetricsAnalyzer:
         max_x += buffer
         max_y += buffer
         
-        # Create grid
+        # Create grid (edges in world coordinates)
         x_edges = np.linspace(min_x, max_x, grid_size + 1)
         y_edges = np.linspace(min_y, max_y, grid_size + 1)
-        
-        # Count objects in each cell
+
+        # Count objects in each cell and build a 2D matrix (rows = Y, cols = X)
         cell_counts = []
+        cell_counts_matrix = np.zeros((grid_size, grid_size), dtype=int)
         for i in tqdm(range(grid_size), desc="Processing grid rows", unit="row"):
             for j in range(grid_size):
                 # Define cell bounds
-                x_min, x_max = x_edges[j], x_edges[j + 1]
-                y_min, y_max = y_edges[i], y_edges[i + 1]
-                
-                # Count centroids in cell
+                x_min_cell, x_max_cell = x_edges[j], x_edges[j + 1]
+                y_min_cell, y_max_cell = y_edges[i], y_edges[i + 1]
+
+                # Count centroids in cell (include left/bottom edges, exclude right/top)
                 in_cell = (
-                    (centroids[:, 0] >= x_min) & (centroids[:, 0] < x_max) &
-                    (centroids[:, 1] >= y_min) & (centroids[:, 1] < y_max)
+                    (centroids[:, 0] >= x_min_cell) & (centroids[:, 0] < x_max_cell) &
+                    (centroids[:, 1] >= y_min_cell) & (centroids[:, 1] < y_max_cell)
                 )
-                cell_counts.append(int(np.sum(in_cell)))
+                cnt = int(np.sum(in_cell))
+                cell_counts.append(cnt)
+                cell_counts_matrix[i, j] = cnt
         
         # Calculate statistics
         cell_counts_arr = np.array(cell_counts)
@@ -730,7 +770,12 @@ class SpatialMetricsAnalyzer:
             'max_count': int(cell_counts_arr.max()),
             'pattern': pattern,
             'grid_size': grid_size,
-            'cell_counts': cell_counts
+            'cell_counts': cell_counts,
+            # Provide 2D matrix (rows=Y from min_y->max_y, cols=X from min_x->max_x)
+            'cell_counts_matrix': cell_counts_matrix,
+            # Provide spatial metadata for plotting (min_x, max_x, min_y, max_y)
+            'extent': (min_x, max_x, min_y, max_y),
+            'cell_size_m': ((max_x - min_x) / grid_size, (max_y - min_y) / grid_size)
         }
         
         print(f"  → VMR: {vmr:.3f}")
@@ -739,6 +784,82 @@ class SpatialMetricsAnalyzer:
         print(f"  → Pattern interpretation: {pattern.upper()}")
         
         return results
+
+
+    def _get_density_map(self, bandwidth_m: float = 0.5, output_shape: Optional[Tuple[int, int]] = None, cell_size_m: float = 0.5):
+        """
+        Generate a KDE-like density surface (objects per m^2) from polygon centroids.
+
+        Args:
+            bandwidth_m: Smoothing kernel standard deviation in meters.
+            output_shape: Optional (H, W) tuple in pixels for the output density grid.
+                          If None, the raster size is computed from bounds and cell_size_m.
+            cell_size_m: Target cell size in meters (default: 0.5). Used to compute grid
+                         dimensions if output_shape is not provided. Prevents memory explosion
+                         from extremely fine resolution grids.
+
+        Returns:
+            density (np.ndarray): 2D array of density in objects per m^2
+            extent (tuple): (min_x, max_x, min_y, max_y) world coordinates
+        """
+        # Get centroids
+        polygons = self._load_polygons()
+        if len(polygons) == 0:
+            raise ValueError("No polygons available to compute density map")
+
+        centroids = np.array([[p.centroid.x, p.centroid.y] for p in polygons])
+
+        # Bounds
+        min_x, min_y = centroids.min(axis=0)
+        max_x, max_y = centroids.max(axis=0)
+
+        # Add small buffer
+        buffer = 0.001 * max(max_x - min_x, max_y - min_y)
+        min_x -= buffer
+        min_y -= buffer
+        max_x += buffer
+        max_y += buffer
+
+        # Determine output grid shape
+        if output_shape is None:
+            if cell_size_m is None or cell_size_m <= 0:
+                raise ValueError("cell_size_m must be positive if output_shape is not provided")
+            width_m = max_x - min_x
+            height_m = max_y - min_y
+            nx = max(1, int(np.ceil(width_m / cell_size_m)))
+            ny = max(1, int(np.ceil(height_m / cell_size_m)))
+        else:
+            ny, nx = output_shape
+
+        # Pixel size in meters (may differ slightly from self.meters_per_pixel if output_shape provided)
+        pixel_size_x = (max_x - min_x) / float(nx)
+        pixel_size_y = (max_y - min_y) / float(ny)
+        pixel_area = pixel_size_x * pixel_size_y
+
+        # Rasterize centroids to impulse image
+        image = np.zeros((ny, nx), dtype=float)
+        # Map world coords to pixel indices (origin at min_x,min_y, y increases upward -> row index)
+        xs = centroids[:, 0]
+        ys = centroids[:, 1]
+        cols = np.clip(((xs - min_x) / (max_x - min_x) * nx).astype(int), 0, nx - 1)
+        rows = np.clip(((ys - min_y) / (max_y - min_y) * ny).astype(int), 0, ny - 1)
+
+        for r, c in zip(rows, cols):
+            image[r, c] += 1.0
+
+        # Convert bandwidth from meters to pixel sigma (use mean pixel size)
+        mean_pixel = np.sqrt(pixel_area)
+        sigma_pixels = max(1.0, float(bandwidth_m) / mean_pixel)
+
+        from scipy.ndimage import gaussian_filter
+        smoothed = gaussian_filter(image, sigma=sigma_pixels, mode='constant')
+
+        # Convert to objects per m^2
+        density = smoothed / pixel_area
+
+        extent = (min_x, max_x, min_y, max_y)
+
+        return density, extent
     
     # =========================================================================
     # PROXIMITY & CLUSTERING METRICS
@@ -862,7 +983,58 @@ class SpatialMetricsAnalyzer:
         print(f"  → Mean NND: {results['mean_nnd_m']:.4f} m")
         print(f"  → Median NND: {results['median_nnd_m']:.4f} m")
         print(f"  → Range: [{results['min_nnd_m']:.4f}, {results['max_nnd_m']:.4f}] m")
-        
+
+        # Build supplementary arrays for cache: centroids and nearest-neighbour indices
+        centroids_px = np.array([[p.centroid.x, p.centroid.y] for p in polygons])
+        centroids_m = centroids_px * self.meters_per_pixel
+
+        # If centroid method, we already have indices from KDTree query
+        try:
+            if method == 'centroid':
+                # Re-run KDTree query to extract nn indices (safe and fast)
+                tree = KDTree(centroids_px)
+                _, idxs = tree.query(centroids_px, k=2)
+                nn_indices = idxs[:, 1].astype(int).tolist()
+            else:
+                # For edge method we may have computed nn indices while calculating distances.
+                # If not present, compute a quick pass to extract indices matching the distances.
+                # We'll compute indices by brute-force using shapely.distance (n small) — acceptable
+                nn_indices = []
+                for i in range(len(polygons)):
+                    # find polygon j that gives distance equal to nnd_values[i]
+                    found_j = -1
+                    target = nnd_values[i] if i < len(nnd_values) else None
+                    if target is None:
+                        nn_indices.append(-1)
+                        continue
+                    # search for the neighbour with matching minimal distance
+                    min_j = -1
+                    min_d = float('inf')
+                    for j in range(len(polygons)):
+                        if i == j:
+                            continue
+                        d = polygons[i].distance(polygons[j])
+                        if d < min_d:
+                            min_d = d
+                            min_j = j
+                    nn_indices.append(int(min_j) if min_j >= 0 else -1)
+        except Exception:
+            # Fallback: use centroid KDTree indices
+            tree = KDTree(centroids_px)
+            _, idxs = tree.query(centroids_px, k=2)
+            nn_indices = idxs[:, 1].astype(int).tolist()
+
+        # Store cache entry
+        cache_entry = {
+            'method': method,
+            'nnd_values_m': nnd_values_m,
+            'nn_indices': nn_indices,
+            'centroids_px': centroids_px,
+            'centroids_m': centroids_m,
+            'metrics': results
+        }
+        self._cached_nnd[method] = cache_entry
+
         return results
     
     def calculate_passability_index(self) -> Dict[str, float]:
@@ -1368,18 +1540,18 @@ class SpatialMetricsAnalyzer:
                 
                 # Calculate side lengths of the OBB
                 # The rectangle has 5 coords (closed ring), use first 3 for 2 sides
-                side1 = np.sqrt(
-                    (obb_coords[1][0] - obb_coords[0][0])**2 + 
-                    (obb_coords[1][1] - obb_coords[0][1])**2
-                ) * scale
-                side2 = np.sqrt(
-                    (obb_coords[2][0] - obb_coords[1][0])**2 + 
-                    (obb_coords[2][1] - obb_coords[1][1])**2
-                ) * scale
+                side1_dx = obb_coords[1][0] - obb_coords[0][0]
+                side1_dy = obb_coords[1][1] - obb_coords[0][1]
+                side1 = np.sqrt(side1_dx**2 + side1_dy**2) * scale
+                
+                side2_dx = obb_coords[2][0] - obb_coords[1][0]
+                side2_dy = obb_coords[2][1] - obb_coords[1][1]
+                side2 = np.sqrt(side2_dx**2 + side2_dy**2) * scale
                 
                 # Aspect ratio = short side / long side
-                if max(side1, side2) > 0:
-                    obb_aspect_ratio = min(side1, side2) / max(side1, side2)
+                max_side = max(side1, side2)
+                if max_side > 0:
+                    obb_aspect_ratio = min(side1, side2) / max_side
                 else:
                     obb_aspect_ratio = 1.0
             except Exception:
