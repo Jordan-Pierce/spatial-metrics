@@ -1340,7 +1340,7 @@ class SpatialMetricsVisualizer:
             # Isolate slope values at perimeter pixels only
             perimeter_slopes = np.where(perimeter_mask, slope_degrees, np.nan)
             
-            extent = [0, mask.shape[1] * meters_per_px, mask.shape[0] * meters_per_pixel, 0]
+            extent = [0, mask.shape[1] * meters_per_px, mask.shape[0] * meters_per_px, 0]
             
             # Reversed Red-Yellow-Green: intuitive traffic light metaphor
             im = ax.imshow(
@@ -1817,7 +1817,7 @@ class SpatialMetricsVisualizer:
         )
 
         min_x, max_x, min_y, max_y = extent_world
-        img_extent_mpl = [min_x, max_x, max_y, min_y]   # imshow: [left, right, bottom, top]
+        img_extent_mpl = [min_x, max_x, max_y, min_y]   # imshow origin='upper': [left, right, bottom, top] where bottom>top (Y inverted)
 
         vmax_d = float(np.nanpercentile(density, 99)) if density.size > 0 else 1.0
         if vmax_d == 0:
@@ -1858,6 +1858,9 @@ class SpatialMetricsVisualizer:
                 zorder=2,
             )
 
+            # Ensure 1:1 aspect so X and Y meters scale equally (prevents squished figures)
+            ax.set_aspect('equal', adjustable='box')
+
             # Contour lines
             if len(contour_levels) > 0:
                 # Build a meshgrid matching density orientation
@@ -1866,7 +1869,7 @@ class SpatialMetricsVisualizer:
                 XX, YY = np.meshgrid(xs, ys)
                 # density is stored origin='upper' (row 0 = max_y), flip for contour alignment
                 ax.contour(
-                    XX, YY, np.flipud(density),
+                    XX, YY, density,
                     levels=contour_levels,
                     colors='white',
                     linewidths=0.6,
@@ -2422,23 +2425,23 @@ def visualize_all_metrics(
     print("GENERATING ALL METRIC VISUALIZATIONS")
     print("="*60 + "\n")
     
-    try:
-        results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
-    except Exception as e:
-        print(f"[ERROR] NND visualization failed: {e}")
-        results['nearest_neighbor_distance'] = None
+    # try:
+    #     results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
+    # except Exception as e:
+    #     print(f"[ERROR] NND visualization failed: {e}")
+    #     results['nearest_neighbor_distance'] = None
     
-    try:
-        results['passability_index'] = viz.visualize_passability_index()
-    except Exception as e:
-        print(f"[ERROR] Passability visualization failed: {e}")
-        results['passability_index'] = None
+    # try:
+    #     results['passability_index'] = viz.visualize_passability_index()
+    # except Exception as e:
+    #     print(f"[ERROR] Passability visualization failed: {e}")
+    #     results['passability_index'] = None
 
-    try:
-        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    except Exception as e:
-        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-        results['spatial_homogeneity'] = None
+    # try:
+    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    # except Exception as e:
+    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+    #     results['spatial_homogeneity'] = None
 
     try:
         results['resource_density'] = viz.visualize_resource_density(bandwidth_m=0.5)
@@ -2446,24 +2449,24 @@ def visualize_all_metrics(
         print(f"[ERROR] Resource density visualization failed: {e}")
         results['resource_density'] = None
     
-    try:
-        results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
-    except Exception as e:
-        print(f"[ERROR] Solidity visualization failed: {e}")
-        results['solidity_rugosity'] = None
+    # try:
+    #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
+    # except Exception as e:
+    #     print(f"[ERROR] Solidity visualization failed: {e}")
+    #     results['solidity_rugosity'] = None
     
-    try:
-        results['obb_directionality'] = viz.visualize_obb_directionality()
-    except Exception as e:
-        print(f"[ERROR] OBB visualization failed: {e}")
-        results['obb_directionality'] = None
+    # try:
+    #     results['obb_directionality'] = viz.visualize_obb_directionality()
+    # except Exception as e:
+    #     print(f"[ERROR] OBB visualization failed: {e}")
+    #     results['obb_directionality'] = None
 
-    # Bivariate Ripley's K (Invisible Halo)
-    try:
-        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    except Exception as e:
-        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-        results['bivariate_ripleys_k'] = None
+    # # Bivariate Ripley's K (Invisible Halo)
+    # try:
+    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    # except Exception as e:
+    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+    #     results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     # try:
