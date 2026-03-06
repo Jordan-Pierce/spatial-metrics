@@ -91,7 +91,9 @@ class SpatialMetricsAnalyzer:
         elevation_path: Optional[str] = None,
         mask_path: Optional[str] = None,
         geojson_path: Optional[str] = None,
-        scale_factor: float = 1.0
+        scale_factor: float = 1.0,
+        width_in_meters: Optional[float] = None,
+        z_scale: float = 1.0
     ):
         """
         Initialize the SpatialMetricsAnalyzer with optional data inputs.
@@ -120,12 +122,20 @@ class SpatialMetricsAnalyzer:
         # Validate scale factor
         if scale_factor <= 0:
             raise ValueError("scale_factor must be positive")
+        # Validate z_scale
+        if z_scale <= 0:
+            raise ValueError("z_scale must be positive")
         
         # Store paths (convert to Path objects if provided)
         self.image_path = Path(image_path) if image_path else None
         self.elevation_path = Path(elevation_path) if elevation_path else None
         self.mask_path = Path(mask_path) if mask_path else None
         self.geojson_path = Path(geojson_path) if geojson_path else None
+        # Optional physical width of the image (meters). When provided, used to
+        # compute a uniform meters_per_pixel = width_in_meters / image_pixel_width.
+        self.width_in_meters = float(width_in_meters) if width_in_meters is not None else None
+        # Vertical scale applied to elevation rasters (convert arbitrary units to meters)
+        self.z_scale = float(z_scale)
         
         # Validate file existence
         for path, name in [
@@ -174,38 +184,51 @@ class SpatialMetricsAnalyzer:
         Note:
             Priority order for CRS detection: mask -> elevation -> image
         """
+        # If the user provided an explicit physical image width, use it to
+        # compute a uniform meters_per_pixel value. Prefer mask raster (pixel
+        # grid matches analysis), then image, then elevation.
+        if self.width_in_meters is not None:
+            candidate_paths = [self.mask_path, self.image_path, self.elevation_path]
+            for p in candidate_paths:
+                if p is None:
+                    continue
+                try:
+                    with rasterio.open(p) as src:
+                        pixel_width = src.width
+                        if pixel_width > 0:
+                            meters_per_pixel = float(self.width_in_meters) / float(pixel_width)
+                            print(f"[INFO] Using provided width_in_meters={self.width_in_meters} m and raster {p.name} (pixels={pixel_width})")
+                            print(f"[INFO] Calculated scale from width_in_meters: {meters_per_pixel:.6f} m/px")
+                            return meters_per_pixel
+                except Exception as e:
+                    print(f"[WARNING] Could not open raster {p} to compute scale from width_in_meters: {e}")
+
+            print(f"[WARNING] width_in_meters provided but no raster could be opened; falling back to CRS/scale_factor detection")
+
         # Try to detect CRS from available rasters (priority: mask > elevation > image)
         raster_paths = [self.mask_path, self.elevation_path, self.image_path]
-        
+
         for raster_path in raster_paths:
             if raster_path is None:
                 continue
-                
             try:
                 with rasterio.open(raster_path) as src:
                     crs = src.crs
                     transform = src.transform
-                    
                     # Check if CRS is projected (has linear units like meters)
                     if crs is not None and crs.is_projected:
                         # Extract pixel size from affine transform
-                        # transform.a is the pixel width, transform.e is pixel height (negative)
                         pixel_size_x = abs(transform.a)
                         pixel_size_y = abs(transform.e)
-                        
-                        # Use average if not square pixels
                         meters_per_pixel = (pixel_size_x + pixel_size_y) / 2
-                        
                         print(f"[INFO] Detected projected CRS: {crs}")
                         print(f"[INFO] Calculated scale: {meters_per_pixel:.6f} m/px")
-                        
                         return meters_per_pixel
                     else:
                         print(f"[INFO] CRS is geographic or missing, using scale_factor")
-                        
             except Exception as e:
                 print(f"[WARNING] Could not read CRS from {raster_path}: {e}")
-        
+
         # Fallback to user-provided scale factor
         print(f"[INFO] Using provided scale_factor: {self.scale_factor} m/px")
         return self.scale_factor
@@ -269,13 +292,16 @@ class SpatialMetricsAnalyzer:
         
         print("[INFO] Loading elevation raster...")
         with rasterio.open(self.elevation_path) as src:
-            self._elevation_data = src.read(1).astype(np.float32)
+            raw = src.read(1).astype(np.float32)
             self._elevation_transform = src.transform
-            
+
             # Handle nodata values
             nodata = src.nodata
             if nodata is not None:
-                self._elevation_data[self._elevation_data == nodata] = np.nan
+                raw[raw == nodata] = np.nan
+
+            # Apply vertical scaling to convert raster units to meters
+            self._elevation_data = raw * float(self.z_scale)
 
         print(f"[INFO] Elevation loaded: shape={self._elevation_data.shape}")
         return self._elevation_data
@@ -1648,8 +1674,8 @@ class SpatialMetricsAnalyzer:
         print("  Computing elevation gradients...")
         
         # Calculate gradient (change in elevation per pixel)
-        # Scale by meters_per_pixel to get proper slope
-        dz_dy, dz_dx = np.gradient(elevation)
+        # Provide physical spacing so numpy computes true rise/run in meters
+        dz_dy, dz_dx = np.gradient(elevation, self.meters_per_pixel)
         
         # -----------------------------------------------------------------
         # CALCULATE SURFACE AREA ELEMENT
@@ -1938,7 +1964,7 @@ class SpatialMetricsAnalyzer:
         # -----------------------------------------------------------------
         # COMPUTE ELEVATION GRADIENTS
         # -----------------------------------------------------------------
-        dz_dx, dz_dy = np.gradient(elevation)
+        dz_dx, dz_dy = np.gradient(elevation, self.meters_per_pixel)
         
         # Extract gradients at perimeter pixels
         perimeter_indices = np.where(perimeter_mask)
@@ -3224,6 +3250,8 @@ def analyze(
     elevation_path: Optional[str] = None,
     image_path: Optional[str] = None,
     scale_factor: float = 1.0,
+    width_in_meters: Optional[float] = None,
+    z_scale: float = 1.0,
     output_path: Optional[str] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
@@ -3256,7 +3284,9 @@ def analyze(
         elevation_path=elevation_path,
         mask_path=mask_path,
         geojson_path=geojson_path,
-        scale_factor=scale_factor
+        scale_factor=scale_factor,
+        width_in_meters=width_in_meters,
+        z_scale=z_scale
     )
     
     return analyzer.generate_report(output_path=output_path)

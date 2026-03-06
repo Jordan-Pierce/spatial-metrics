@@ -187,12 +187,15 @@ class SpatialMetricsVisualizer:
         try:
             print("[INFO] Loading elevation raster...")
             with rasterio.open(self.analyzer.elevation_path) as src:
-                self.elevation_array = src.read(1).astype(np.float32)
+                raw = src.read(1).astype(np.float32)
                 self.elevation_transform = src.transform
-                
+
                 # Handle nodata values by replacing with NaNs
                 if src.nodata is not None:
-                    self.elevation_array[self.elevation_array == src.nodata] = np.nan
+                    raw[raw == src.nodata] = np.nan
+
+                # Apply analyzer vertical scale (z_scale) so visuals match analyzer units
+                self.elevation_array = raw * float(getattr(self.analyzer, 'z_scale', 1.0))
             
             # If orthomosaic is available, ensure DEM matches its pixel grid.
             if self.orthomosaic_array is not None and self.elevation_array is not None:
@@ -1165,7 +1168,8 @@ class SpatialMetricsVisualizer:
             return {}
         
         # Calculate terrain gradient (slope)
-        dz_dy, dz_dx = np.gradient(elevation * meters_per_px)  # Scale to meters
+        # Compute gradients using physical spacing (meters per pixel)
+        dz_dy, dz_dx = np.gradient(elevation, meters_per_px)
         slope_radians = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
         slope_degrees = np.degrees(slope_radians)
         
