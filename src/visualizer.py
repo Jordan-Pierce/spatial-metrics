@@ -105,6 +105,11 @@ class SpatialMetricsVisualizer:
         self.elevation_transform: Optional[Any] = None
         self._cached_polygons: Optional[List[Polygon]] = None
         self._exemplar_indices: Optional[List[int]] = None
+        # Per-metric legend specifications (populated by plotting routines).
+        # Each entry: metric_name -> {'cmap': <cmap>, 'norm': <Normalize|None>, 'label': <str>, 'orientation': 'vertical'|'horizontal'}
+        self._legend_specs: Dict[str, Dict[str, Any]] = {}
+        # Storage for inset (mini-plot) specifications to save separately
+        self._inset_specs: Dict[str, Dict[str, Any]] = {}
         
         self._load_orthomosaic()
         self._load_elevation()
@@ -572,7 +577,15 @@ class SpatialMetricsVisualizer:
         vmax_nnd = np.percentile(nnd_values_m, 95)
         nnd_cmap = plt.cm.RdYlGn   # Red=tight, Green=spacious
         nnd_norm = Normalize(vmin=vmin_nnd, vmax=vmax_nnd)
-
+        
+        # Register legend spec instead of creating an inline colorbar.
+        # Legend images will be saved later by _save_legends().
+        self._legend_specs['nearest_neighbor_distance'] = {
+            'cmap': nnd_cmap,
+            'norm': nnd_norm,
+            'label': 'Gap to nearest neighbour (m)',
+            'orientation': 'vertical'
+        }
         def plot_nnd(ax: plt.Axes, mode: str) -> None:
             """Render NND: polygons coloured by gap score + connector lines + inset histogram."""
             polygons = self.analyzer._load_polygons()
@@ -612,32 +625,20 @@ class SpatialMetricsVisualizer:
                                 linewidths=0.8, alpha=0.45, zorder=3)
             ax.add_collection(lc)
 
-            # --- Colourbar ---
-            sm = ScalarMappable(cmap=nnd_cmap, norm=nnd_norm)
-            sm.set_array([])
-            cb = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
-            cb.set_label('Gap to nearest neighbour (m)', color='white', fontsize=8)
-            cb.ax.yaxis.set_tick_params(color='#8B949E', labelcolor='#8B949E', labelsize=7)
-            cb.outline.set_edgecolor('#30363D')
+            # Colourbar removed from inline figures; legend spec recorded for later saving
+            pass
 
             # --- Inset histogram of NND distribution ---
+            # Instead of drawing the inset inline, record spec for later saving as a
+            # standalone inset image to avoid cluttering each plot with small legends.
             if len(nnd_values_m) > 1:
-                ax_hist = ax.inset_axes([0.02, 0.72, 0.28, 0.25])
-                ax_hist.set_facecolor('#161B22')
-                ax_hist.patch.set_alpha(0.85)
-                n_bins = min(30, max(10, len(nnd_values_m) // 5))
-                counts, bin_edges = np.histogram(nnd_values_m, bins=n_bins)
-                bin_colors = [nnd_cmap(nnd_norm((e + bin_edges[k+1]) / 2))
-                              for k, e in enumerate(bin_edges[:-1])]
-                ax_hist.bar(bin_edges[:-1], counts, width=np.diff(bin_edges),
-                            color=bin_colors, edgecolor='none', align='edge')
-                ax_hist.axvline(distance_threshold_m, color='#FF4B4B',
-                                linewidth=1.2, linestyle='--', alpha=0.9)
-                ax_hist.set_xlabel('NND (m)', fontsize=6, color='#8B949E')
-                ax_hist.set_ylabel('Count', fontsize=6, color='#8B949E')
-                ax_hist.tick_params(labelsize=5, colors='#8B949E')
-                for spine in ax_hist.spines.values():
-                    spine.set_edgecolor('#30363D')
+                self._inset_specs['nearest_neighbor_distance'] = {
+                    'type': 'hist',
+                    'values': nnd_values_m.copy(),
+                    'threshold': distance_threshold_m,
+                    'cmap': nnd_cmap,
+                    'norm': nnd_norm
+                }
 
         return self._render_and_save('nearest_neighbor_distance', plot_nnd)
 
@@ -721,11 +722,13 @@ class SpatialMetricsVisualizer:
                                       ec='#FF4B4B', alpha=0.85),
                             zorder=12)
 
-            # --- Colorbar ---
-            cb = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-            cb.set_label('Clearance to nearest obstacle (m)', color='white', fontsize=8)
-            cb.ax.yaxis.set_tick_params(color='#8B949E', labelcolor='#8B949E', labelsize=7)
-            cb.outline.set_edgecolor('#30363D')
+            # Record legend specification for passability (no inline colorbar)
+            self._legend_specs['passability_index'] = {
+                'cmap': plt.cm.magma,
+                'norm': Normalize(vmin=0, vmax=max_r),
+                'label': 'Clearance to nearest obstacle (m)',
+                'orientation': 'vertical'
+            }
 
         return self._render_and_save('passability_index', plot_passability)
 
@@ -1011,11 +1014,17 @@ class SpatialMetricsVisualizer:
                 vmin=0,  # Color scale starts at zero stick-up
                 vmax=np.nanmax(stick_up_masked)
             )
-            
-            # Only show colorbar in clean mode to avoid clutter
-            if mode == 'clean':
-                cbar = plt.colorbar(im, ax=ax, label='Stick-up Height (meters)', shrink=0.8)
-                cbar.ax.tick_params(labelsize=9)
+            # Record legend spec (do not create inline colorbar). Use sensible vmin/vmax.
+            try:
+                vmax_val = float(np.nanmax(stick_up_masked))
+            except Exception:
+                vmax_val = 0.0
+            self._legend_specs['protrusion'] = {
+                'cmap': plt.cm.plasma,
+                'norm': Normalize(vmin=0, vmax=vmax_val),
+                'label': 'Stick-up Height (meters)',
+                'orientation': 'vertical'
+            }
             
             ax.set_title('Protrusion: Collector Clearance Map', fontsize=12, fontweight='bold')
         
@@ -1052,13 +1061,13 @@ class SpatialMetricsVisualizer:
                 ax.plot_surface(X, Y, elev_dec,
                                 facecolors=face_colors,
                                 linewidth=0, antialiased=True, alpha=0.92, zorder=2)
-                # Colourbar
-                sm = ScalarMappable(cmap='plasma', norm=norm_su)
-                sm.set_array([])
-                cb = plt.colorbar(sm, ax=ax, shrink=0.45, pad=0.08)
-                cb.set_label('Stick-up (m)', color='white', fontsize=8)
-                cb.ax.yaxis.set_tick_params(color='#8B949E', labelcolor='#8B949E', labelsize=7)
-                cb.outline.set_edgecolor('#30363D')
+                # Record legend spec for protrusion 3D (shares cmap/norm with 2D)
+                self._legend_specs['protrusion'] = {
+                    'cmap': plt.cm.plasma,
+                    'norm': norm_su,
+                    'label': 'Stick-up (m)',
+                    'orientation': 'vertical'
+                }
 
             elif mode == 'overlay' and self.orthomosaic_array is not None:
                 img_dec = self.orthomosaic_array[::stride, ::stride]
@@ -1178,10 +1187,13 @@ class SpatialMetricsVisualizer:
                 vmin=0,
                 vmax=90  # Slope angles range 0-90 degrees
             )
-            
-            if mode == 'clean':
-                cbar = plt.colorbar(im, ax=ax, label='Contact Slope / Embedment Angle (°)', shrink=0.8)
-                cbar.ax.tick_params(labelsize=9)
+            # Record legend spec for embedment angle (no inline colorbar)
+            self._legend_specs['embedment_angle'] = {
+                'cmap': plt.cm.RdYlGn_r,
+                'norm': Normalize(vmin=0, vmax=90),
+                'label': 'Contact Slope / Embedment Angle (°)',
+                'orientation': 'vertical'
+            }
             
             ax.set_title('Embedment Angle: Breakout Force Perimeter Rings', fontsize=12, fontweight='bold')
         
@@ -1214,10 +1226,13 @@ class SpatialMetricsVisualizer:
                     alpha=0.9
                 )
                 
-                # Create fake mappable for colorbar
-                m = plt.cm.ScalarMappable(cmap='RdYlGn_r', norm=norm)
-                m.set_array([])
-                plt.colorbar(m, ax=ax, label='Surface Gradient (°)', shrink=0.5)
+                # Record legend spec for embedment angle (3D surface)
+                self._legend_specs['embedment_angle'] = {
+                    'cmap': plt.cm.RdYlGn_r,
+                    'norm': norm,
+                    'label': 'Surface Gradient (°)',
+                    'orientation': 'vertical'
+                }
             
             elif mode == 'overlay' and self.orthomosaic_array is not None:
                 # 1. Drape RGB photo over terrain (base layer)
@@ -1259,7 +1274,13 @@ class SpatialMetricsVisualizer:
                     vmax=90,
                     zorder=10  # Render on top of terrain
                 )
-                plt.colorbar(scatter, ax=ax, label='Contact Angle (°)', shrink=0.5)
+                # Record legend spec for scatter-based contact angle (3D overlay)
+                self._legend_specs['embedment_angle'] = {
+                    'cmap': plt.cm.RdYlGn_r,
+                    'norm': Normalize(vmin=0, vmax=90),
+                    'label': 'Contact Angle (°)',
+                    'orientation': 'vertical'
+                }
             
             ax.set_title('3D Embedment Angle', fontsize=12, fontweight='bold')
         
@@ -1304,6 +1325,14 @@ class SpatialMetricsVisualizer:
             pv = pv / (np.linalg.norm(pv) + 1e-9)
             angles_deg.append(np.degrees(np.arctan2(pv[1], pv[0])) % 360)
         angles_deg = np.array(angles_deg)
+
+        # Legend spec for orientation (cyclic HSV colormap, degrees 0-360)
+        self._legend_specs['obb_directionality'] = {
+            'cmap': plt.cm.hsv,
+            'norm': Normalize(vmin=0, vmax=360),
+            'label': 'OBB Orientation (°)',
+            'orientation': 'vertical'
+        }
 
         def plot_obb(ax: plt.Axes, mode: str) -> None:
             """Render OBB: polygons + directional lines coloured by orientation + rose inset."""
@@ -1352,29 +1381,14 @@ class SpatialMetricsVisualizer:
                                                  linewidths=1.5, alpha=0.88, zorder=4))
 
             # --- Rose diagram inset ---
+            # Record rose inset data to be saved as a separate image instead of
+            # drawing it inline inside each OBB plot.
             if len(angles_deg) > 0:
-                ax_rose = ax.inset_axes([0.72, 0.72, 0.26, 0.26],
-                                         projection='polar')
-                ax_rose.set_facecolor('#161B22')
-                ax_rose.patch.set_alpha(0.85)
-                n_bins = 24
-                bin_edges = np.linspace(0, 2 * np.pi, n_bins + 1)
-                # Fold 180° ambiguity: a line at 10° and 190° are the same direction
-                folded = np.deg2rad(angles_deg % 180) * 2  # map [0,180)→[0,360)
-                counts, _ = np.histogram(folded, bins=bin_edges)
-                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-                bar_width = 2 * np.pi / n_bins
-                bar_colors = [hsv_to_rgb([theta / (2 * np.pi), 0.8, 0.9])
-                               for theta in bin_centers]
-                ax_rose.bar(bin_centers, counts, width=bar_width,
-                            color=bar_colors, edgecolor='none', alpha=0.85)
-                ax_rose.set_yticks([])
-                ax_rose.tick_params(labelsize=5, colors='#8B949E', pad=1)
-                ax_rose.set_theta_zero_location('E')
-                ax_rose.set_theta_direction(1)
-                ax_rose.spines['polar'].set_edgecolor('#30363D')
-                ax_rose.set_title('Orientation\nrose', fontsize=6,
-                                  color='#8B949E', pad=2)
+                self._inset_specs['obb_directionality'] = {
+                    'type': 'rose',
+                    'angles_deg': angles_deg.copy(),
+                    'n_bins': 24
+                }
 
             # Compass label
             ax.text(0.99, 0.01, '0°→E  ·  90°→N',
@@ -1383,6 +1397,136 @@ class SpatialMetricsVisualizer:
                     bbox=dict(boxstyle='round,pad=0.25', fc='#0D1117', ec='#30363D', alpha=0.8))
 
         return self._render_and_save('obb_directionality', plot_obb)
+
+    def _save_legends(self) -> Dict[str, str]:
+        """Iterate self._legend_specs and save a small image per metric showing only the colorbar.
+
+        Returns a dict mapping metric_name -> file path string.
+        """
+        out = {}
+        for metric, spec in self._legend_specs.items():
+            cmap = spec.get('cmap', plt.cm.viridis)
+            norm = spec.get('norm', None)
+            label = spec.get('label', '')
+            orientation = spec.get('orientation', 'vertical')
+
+            # Choose figure size by orientation
+            if orientation == 'horizontal':
+                figsize = (4, 1)
+                cbar_ax_rect = [0.12, 0.45, 0.76, 0.35]
+            else:
+                figsize = (2, 4)
+                cbar_ax_rect = [0.35, 0.05, 0.3, 0.9]
+
+            fig = plt.figure(figsize=figsize, dpi=self.figure_dpi)
+            # Create an axes for the colorbar only
+            cax = fig.add_axes(cbar_ax_rect)
+
+            sm = ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            cb = fig.colorbar(sm, cax=cax, orientation=orientation)
+            cb.set_label(label, fontsize=8)
+            # Minimal tick styling
+            if orientation == 'horizontal':
+                cb.ax.xaxis.set_tick_params(labelsize=7)
+            else:
+                cb.ax.yaxis.set_tick_params(labelsize=7)
+
+            out_path = self.output_dir / f"{metric}_legend.png"
+            plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
+            plt.close(fig)
+            out[metric] = str(out_path)
+
+        return out
+
+    def save_legends(self) -> Dict[str, str]:
+        """Public wrapper to generate and save legend images for recorded metrics."""
+        return self._save_legends()
+
+    def _save_insets(self) -> Dict[str, str]:
+        """Save recorded inset plots (histograms, roses) as standalone images.
+
+        Returns a dict mapping metric_name -> inset file path.
+        """
+        out = {}
+        for metric, spec in self._inset_specs.items():
+            itype = spec.get('type')
+
+            if itype == 'hist':
+                values = np.asarray(spec.get('values', []))
+                threshold = spec.get('threshold', None)
+                cmap = spec.get('cmap', plt.cm.viridis)
+                norm = spec.get('norm', None)
+
+                n_bins = min(30, max(10, len(values) // 5))
+                fig, ax = plt.subplots(1, 1, figsize=(4, 2), dpi=self.figure_dpi)
+                ax.set_facecolor('#161B22')
+                ax.patch.set_alpha(0.85)
+                counts, bin_edges = np.histogram(values, bins=n_bins)
+                # Compute bin center colors using provided cmap/norm
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                if norm is not None:
+                    bin_colors = [cmap(norm(c)) for c in bin_centers]
+                else:
+                    # fallback linear normalization across data range
+                    vmin, vmax = float(np.nanmin(values)), float(np.nanmax(values))
+                    tmp_norm = Normalize(vmin=vmin, vmax=max(vmax, vmin + 1e-9))
+                    bin_colors = [cmap(tmp_norm(c)) for c in bin_centers]
+
+                ax.bar(bin_edges[:-1], counts, width=np.diff(bin_edges),
+                       color=bin_colors, edgecolor='none', align='edge')
+                if threshold is not None:
+                    ax.axvline(threshold, color='#FF4B4B', linewidth=1.2, linestyle='--', alpha=0.9)
+                ax.set_xlabel('Value', fontsize=8, color='#8B949E')
+                ax.set_ylabel('Count', fontsize=8, color='#8B949E')
+                ax.tick_params(labelsize=7, colors='#8B949E')
+                for spine in ax.spines.values():
+                    spine.set_edgecolor('#30363D')
+
+                out_path = self.output_dir / f"{metric}_inset_hist.png"
+                plt.tight_layout()
+                plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
+                plt.close(fig)
+                out[metric] = str(out_path)
+
+            elif itype == 'rose':
+                angles = np.asarray(spec.get('angles_deg', []))
+                n_bins = int(spec.get('n_bins', 24))
+                fig = plt.figure(figsize=(3, 3), dpi=self.figure_dpi)
+                ax = fig.add_subplot(111, projection='polar')
+                ax.set_facecolor('#161B22')
+                ax.patch.set_alpha(0.85)
+                bin_edges = np.linspace(0, 2 * np.pi, n_bins + 1)
+                folded = np.deg2rad(angles % 180) * 2
+                counts, _ = np.histogram(folded, bins=bin_edges)
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                bar_width = 2 * np.pi / n_bins
+                bar_colors = [hsv_to_rgb([theta / (2 * np.pi), 0.8, 0.9])
+                              for theta in bin_centers]
+                ax.bar(bin_centers, counts, width=bar_width, color=bar_colors,
+                       edgecolor='none', alpha=0.85)
+                ax.set_yticks([])
+                ax.tick_params(labelsize=6, colors='#8B949E', pad=1)
+                ax.set_theta_zero_location('E')
+                ax.set_theta_direction(1)
+                ax.spines['polar'].set_edgecolor('#30363D')
+                ax.set_title('Orientation\nrose', fontsize=8, color='#8B949E', pad=2)
+
+                out_path = self.output_dir / f"{metric}_inset_rose.png"
+                plt.tight_layout()
+                plt.savefig(out_path, dpi=self.figure_dpi, bbox_inches='tight')
+                plt.close(fig)
+                out[metric] = str(out_path)
+
+            else:
+                # Unknown inset type: skip
+                continue
+
+        return out
+
+    def save_insets(self) -> Dict[str, str]:
+        """Public wrapper to generate and save recorded inset images."""
+        return self._save_insets()
 
 
 # =============================================================================
@@ -1506,4 +1650,20 @@ def visualize_all_metrics(
     print("VISUALIZATION GENERATION COMPLETE")
     print("="*60)
     
+    # Save collected legend images and include mapping in results
+    try:
+        legends_map = viz._save_legends()
+        results['legends'] = legends_map
+    except Exception as e:
+        print(f"[WARNING] Saving legends failed: {e}")
+        results['legends'] = {}
+
+    # Save recorded insets (histograms, roses) as separate images
+    try:
+        insets_map = viz._save_insets()
+        results['insets'] = insets_map
+    except Exception as e:
+        print(f"[WARNING] Saving insets failed: {e}")
+        results['insets'] = {}
+
     return results
