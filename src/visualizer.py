@@ -1631,158 +1631,64 @@ class SpatialMetricsVisualizer:
     # RESOURCE DISTRIBUTION SUITE
     # =========================================================================
 
-    def visualize_spatial_homogeneity(self, grid_size: int = 4) -> Dict[str, str]:
+    def visualize_spatial_homogeneity(self, grid_size: int = 32) -> Dict[str, str]:
         """
-        Visualize Spatial Homogeneity via a Quadrat Choropleth map.
-
-        Produces three low-resolution figures (clean, overlay, combined) showing
-        object count per grid cell coloured with the ``viridis`` colormap.  Each
-        cell is annotated with its raw integer count.  In overlay mode the tile
-        layer is drawn at alpha=0.45 so the seafloor texture remains visible.
-
-        A standalone ``homogeneity_stats.png`` is also saved containing a
-        histogram of quadrat counts and a stylised VMR / pattern label.
-
-        Uses _render_and_save_low_res to avoid memory allocation failures: at
-        the default 96 DPI the combined canvas is ~1152×480 px rather than the
-        ~7200×3000 px that the standard 300-DPI renderer would produce.
-
-        Args:
-            grid_size: Number of cells per axis (default 4 → 4×4 = 16 cells).
-
-        Returns:
-            Dict[str, str]: Output paths including 'clean', 'overlay',
-                'combined', and 'stats'.
+        Visualize Spatial Homogeneity via a simple Quadrat grid.
+        
+        Uses a 2D histogram of polygon centroids to generate a clean,
+        informative grid showing object counts per cell.
         """
-        print("\n[VIS] Generating Spatial Homogeneity (Quadrat Choropleth)...")
-
-        results = self.analyzer.calculate_spatial_homogeneity(grid_size=grid_size)
-        grid = results.get('cell_counts_matrix')
-        if grid is None:
-            counts = results.get('cell_counts', [])
-            n = results.get('grid_size', grid_size)
-            grid = np.array(counts, dtype=float).reshape(n, n) if len(counts) == n * n else np.zeros((n, n))
-        grid = np.asarray(grid, dtype=float)
-        n_rows, n_cols = grid.shape
-
-        extent_world = results.get('extent', None)   # (min_x, max_x, min_y, max_y)
-        vmr = results.get('vmr', 0.0)
-        pattern = results.get('pattern', 'unknown').upper()
-        mean_count = results.get('mean_count', 0.0)
-
-        # Colour normalisation — protect against flat grids
-        vmin_g, vmax_g = float(grid.min()), float(grid.max())
-        if vmax_g == vmin_g:
-            vmax_g = vmin_g + 1.0
-        norm_g = Normalize(vmin=vmin_g, vmax=vmax_g)
-        cmap_g = plt.cm.viridis
-
-        # Register external legend
+        print(f"\n[VIS] Generating Spatial Homogeneity (Quadrat Grid, {grid_size}x{grid_size})...")
+        
+        polygons = self.analyzer._load_polygons()
+        if not polygons:
+            print("[WARNING] No polygons available for spatial homogeneity.")
+            return {}
+            
+        # Extract centroids in physical coordinates
+        centroids = np.array([[p.centroid.x, p.centroid.y] for p in polygons]) * self.analyzer.meters_per_pixel
+        x_min, x_max, y_min, y_max = self._get_axis_limits()
+        
+        # Calculate 2D histogram (quadrat counts)
+        H, xedges, yedges = np.histogram2d(
+            centroids[:, 0], centroids[:, 1], 
+            bins=grid_size, 
+            range=[[x_min, x_max], [y_min, y_max]]
+        )
+        
+        # Setup legend specification
+        cmap = plt.cm.magma
+        norm = Normalize(vmin=0, vmax=H.max() or 1)
         self._legend_specs['spatial_homogeneity'] = {
-            'cmap': cmap_g,
-            'norm': norm_g,
-            'label': 'Objects per quadrat cell',
-            'orientation': 'vertical',
+            'cmap': cmap,
+            'norm': norm,
+            'label': 'Objects per cell',
+            'orientation': 'vertical'
         }
-
+        
         def plot_homogeneity(ax: plt.Axes, mode: str) -> None:
-            # Determine plotting extent in world coordinates
-            if extent_world is not None:
-                min_x, max_x, min_y, max_y = extent_world
-                img_extent = [min_x, max_x, max_y, min_y]  # matplotlib imshow extent
-            else:
-                x_min_ax, x_max_ax, y_min_ax, y_max_ax = self._get_axis_limits()
-                min_x, max_x, min_y, max_y = x_min_ax, x_max_ax, y_min_ax, y_max_ax
-                img_extent = [min_x, max_x, max_y, min_y]
-
-            alpha = 0.45 if mode == 'overlay' else 0.90
-            ax.imshow(
-                grid,
-                cmap=cmap_g,
-                norm=norm_g,
-                origin='lower',
-                extent=img_extent,
-                aspect='auto',
-                alpha=alpha,
-                interpolation='nearest',
-                zorder=2,
-            )
-
-            # Cell size in world units
-            cell_w = (max_x - min_x) / n_cols
-            cell_h = (max_y - min_y) / n_rows
-
-            for row_idx in range(n_rows):
-                for col_idx in range(n_cols):
-                    count_val = int(grid[row_idx, col_idx])
-                    cx = min_x + (col_idx + 0.5) * cell_w
-                    # imshow with origin='lower' means row 0 = bottom
-                    cy = min_y + (row_idx + 0.5) * cell_h
-                    bg = cmap_g(norm_g(float(count_val)))
-                    lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
-                    txt_color = 'black' if lum > 0.5 else 'white'
-                    ax.text(
-                        cx, cy, str(count_val),
-                        ha='center', va='center',
-                        fontsize=8, fontweight='bold',
-                        color=txt_color, zorder=3,
-                    )
-
-            # Draw grid lines
-            for ci in range(n_cols + 1):
-                ax.axvline(min_x + ci * cell_w, color='white', linewidth=0.5, alpha=0.6, zorder=4)
-            for ri in range(n_rows + 1):
-                ax.axhline(min_y + ri * cell_h, color='white', linewidth=0.5, alpha=0.6, zorder=4)
-
-            ax.set_title(
-                f'Quadrat Analysis ({n_rows}×{n_cols})  VMR={vmr:.2f}  [{pattern}]',
-                fontsize=9,
-            )
-
-        output_paths = self._render_and_save_low_res('spatial_homogeneity', plot_homogeneity)
-
-        # ---- External stats figure ----
-        try:
-            cell_counts_arr = grid.ravel()
-            fig, axes = plt.subplots(1, 2, figsize=(7, 3), dpi=96)
-            fig.patch.set_facecolor('#0D1117')
-
-            # Histogram
-            ax_hist = axes[0]
-            ax_hist.set_facecolor('#161B22')
-            n_bins = max(5, min(grid_size * grid_size // 2, 15))
-            ax_hist.hist(cell_counts_arr, bins=n_bins, color='#3DDC84', edgecolor='#0D1117', alpha=0.85)
-            ax_hist.set_xlabel('Objects per cell', fontsize=9, color='#8B949E')
-            ax_hist.set_ylabel('Frequency', fontsize=9, color='#8B949E')
-            ax_hist.tick_params(colors='#8B949E', labelsize=8)
-            ax_hist.axvline(mean_count, color='#FFA500', linewidth=1.4, linestyle='--', label=f'Mean={mean_count:.1f}')
-            ax_hist.legend(fontsize=8, labelcolor='#8B949E', facecolor='#161B22', edgecolor='#30363D')
-            for sp in ax_hist.spines.values():
-                sp.set_edgecolor('#30363D')
-            ax_hist.set_title('Quadrat count distribution', fontsize=9, color='#C9D1D9')
-
-            # VMR label
-            ax_txt = axes[1]
-            ax_txt.set_facecolor('#0D1117')
-            ax_txt.axis('off')
-            pat_color = {'CLUSTERED': '#FF6B6B', 'UNIFORM': '#3DDC84', 'RANDOM': '#FFA500'}.get(pattern, '#C9D1D9')
-            ax_txt.text(0.5, 0.65, f'VMR = {vmr:.3f}', ha='center', va='center',
-                        fontsize=22, fontweight='bold', color='#C9D1D9', transform=ax_txt.transAxes)
-            ax_txt.text(0.5, 0.32, pattern, ha='center', va='center',
-                        fontsize=18, fontweight='bold', color=pat_color, transform=ax_txt.transAxes)
-            ax_txt.text(0.5, 0.10, f'Mean count/cell: {mean_count:.2f}', ha='center', va='center',
-                        fontsize=9, color='#8B949E', transform=ax_txt.transAxes)
-
-            plt.tight_layout()
-            stats_path = self.output_dir / 'homogeneity_stats.png'
-            plt.savefig(stats_path, dpi=96, bbox_inches='tight')
-            plt.close(fig)
-            output_paths['stats'] = str(stats_path)
-            print(f"  ✓ Saved: {stats_path.name}")
-        except Exception as e:
-            print(f"[WARNING] Failed to save homogeneity_stats.png: {e}")
-
-        return output_paths
+            X, Y = np.meshgrid(xedges, yedges)
+            alpha = 0.5 if mode == 'overlay' else 0.95
+            
+            # Plot the quadrat grid (transpose H to match meshgrid orientation)
+            ax.pcolormesh(X, Y, H.T, cmap=cmap, norm=norm, alpha=alpha, edgecolors='white', linewidth=1)
+            
+            # Annotate cells with their object counts
+            for i in range(grid_size):
+                for j in range(grid_size):
+                    count = int(H[i, j])
+                    cx = xedges[i] + (xedges[i+1] - xedges[i]) / 2
+                    cy = yedges[j] + (yedges[j+1] - yedges[j]) / 2
+                    
+                    # Ensure text contrast
+                    text_color = 'black' if norm(count) > 0.5 else 'white'
+                    ax.text(cx, cy, str(count), ha='center', va='center', 
+                            color=text_color, fontweight='bold', fontsize=12)
+                            
+            ax.set_title(f"Spatial Homogeneity ({grid_size}x{grid_size} Quadrat)", fontsize=12, fontweight='bold')
+            
+        # Use standard rendering pipeline
+        return self._render_and_save('spatial_homogeneity', plot_homogeneity)
 
     def visualize_resource_density(self, bandwidth_m: float = 0.5) -> Dict[str, str]:
         """
@@ -2437,11 +2343,11 @@ def visualize_all_metrics(
     #     print(f"[ERROR] Passability visualization failed: {e}")
     #     results['passability_index'] = None
 
-    # try:
-    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    # except Exception as e:
-    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-    #     results['spatial_homogeneity'] = None
+    try:
+        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    except Exception as e:
+        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+        results['spatial_homogeneity'] = None
 
     try:
         results['resource_density'] = viz.visualize_resource_density(bandwidth_m=0.5)
