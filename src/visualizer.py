@@ -1631,219 +1631,82 @@ class SpatialMetricsVisualizer:
     # RESOURCE DISTRIBUTION SUITE
     # =========================================================================
 
-    def visualize_spatial_homogeneity(self, grid_size: int = 32) -> Dict[str, str]:
+    def visualize_spatial_homogeneity(self, grid_size: int = 16, target_class: int = 2) -> Dict[str, str]:
         """
-        Visualize Spatial Homogeneity via a simple Quadrat grid.
+        Visualize Spatial Homogeneity using the Semantic Mask, overlaid with polygons.
         
-        Uses a 2D histogram of polygon centroids to generate a clean,
-        informative grid showing object counts per cell.
+        Divides the mask into a grid and calculates the fractional area coverage
+        of the target class. Renders as a clean heatmap with actual polygon 
+        outlines drawn on top for precise location context.
         """
-        print(f"\n[VIS] Generating Spatial Homogeneity (Quadrat Grid, {grid_size}x{grid_size})...")
+        print(f"\n[VIS] Generating Spatial Homogeneity & Polygons (Grid: {grid_size}x{grid_size}, Class: {target_class})...")
         
-        polygons = self.analyzer._load_polygons()
-        if not polygons:
-            print("[WARNING] No polygons available for spatial homogeneity.")
+        mask = self.analyzer._load_mask()
+        if mask is None:
             return {}
             
-        # Extract centroids in physical coordinates
-        centroids = np.array([[p.centroid.x, p.centroid.y] for p in polygons]) * self.analyzer.meters_per_pixel
-        x_min, x_max, y_min, y_max = self._get_axis_limits()
+        # 1. Create a binary mask of just our target class
+        binary_mask = (mask == target_class).astype(float)
         
-        # Calculate 2D histogram (quadrat counts)
-        H, xedges, yedges = np.histogram2d(
-            centroids[:, 0], centroids[:, 1], 
-            bins=grid_size, 
-            range=[[x_min, x_max], [y_min, y_max]]
-        )
+        # 2. Chop into grid cells and calculate coverage percentage
+        h, w = binary_mask.shape
+        cell_h, cell_w = h // grid_size, w // grid_size
         
-        # Setup legend specification
+        # Crop to perfectly divisible size
+        cropped_mask = binary_mask[:cell_h * grid_size, :cell_w * grid_size]
+        
+        # Reshape and take the mean to get the coverage fraction per cell
+        grid_coverage = cropped_mask.reshape(grid_size, cell_h, grid_size, cell_w).mean(axis=(1, 3))
+        grid_percentage = grid_coverage * 100.0
+        
+        # Calculate VMR on the coverage percentages
+        mean_cov = np.mean(grid_percentage)
+        variance = np.var(grid_percentage, ddof=1) if grid_percentage.size > 1 else 0
+        vmr = variance / mean_cov if mean_cov > 0 else 0
+        
+        if mean_cov == 0: pattern = 'EMPTY'
+        elif vmr < 0.8: pattern = 'UNIFORM'
+        elif vmr > 1.2: pattern = 'CLUSTERED'
+        else: pattern = 'RANDOM'
+        
+        # 3. Setup rendering
+        extent = [0, w * self.analyzer.meters_per_pixel, h * self.analyzer.meters_per_pixel, 0]
         cmap = plt.cm.magma
-        norm = Normalize(vmin=0, vmax=H.max() or 1)
+        norm = Normalize(vmin=0, vmax=max(grid_percentage.max(), 1.0))
+        
         self._legend_specs['spatial_homogeneity'] = {
-            'cmap': cmap,
-            'norm': norm,
-            'label': 'Objects per cell',
+            'cmap': cmap, 'norm': norm,
+            'label': f'Class {target_class} Coverage (%)',
             'orientation': 'vertical'
         }
         
-        def plot_homogeneity(ax: plt.Axes, mode: str) -> None:
-            X, Y = np.meshgrid(xedges, yedges)
-            alpha = 0.5 if mode == 'overlay' else 0.95
-            
-            # Plot the quadrat grid (transpose H to match meshgrid orientation)
-            ax.pcolormesh(X, Y, H.T, cmap=cmap, norm=norm, alpha=alpha, edgecolors='white', linewidth=1)
-            
-            # Annotate cells with their object counts
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    count = int(H[i, j])
-                    cx = xedges[i] + (xedges[i+1] - xedges[i]) / 2
-                    cy = yedges[j] + (yedges[j+1] - yedges[j]) / 2
-                    
-                    # Ensure text contrast
-                    text_color = 'black' if norm(count) > 0.5 else 'white'
-                    ax.text(cx, cy, str(count), ha='center', va='center', 
-                            color=text_color, fontweight='bold', fontsize=12)
-                            
-            ax.set_title(f"Spatial Homogeneity ({grid_size}x{grid_size} Quadrat)", fontsize=12, fontweight='bold')
-            
-        # Use standard rendering pipeline
-        return self._render_and_save('spatial_homogeneity', plot_homogeneity)
-
-    def visualize_resource_density(self, bandwidth_m: float = 0.5) -> Dict[str, str]:
-        """
-        Visualize Resource Density via a KDE heatmap.
-
-        Produces three low-resolution figures (clean, overlay, combined) using
-        the ``magma`` colormap to render a smooth density surface (objects/m²).
-        Topographic contour lines are drawn at 5, 10, and 15 objects/m².
-        In clean mode individual nodule centroids are plotted as tiny white dots.
-
-        A standalone ``density_legend.png`` is saved with a vertical colorbar
-        labelled in objects/m² plus a summary statistics table.
-
-        The KDE grid is capped at MAX_GRID_CELLS=256 per axis to prevent memory
-        allocation failures regardless of image resolution or meters_per_pixel.
-
-        Args:
-            bandwidth_m: Gaussian smoothing radius in meters (default 0.5).
-
-        Returns:
-            Dict[str, str]: Output paths including 'clean', 'overlay',
-                'combined', and 'density_legend'.
-        """
-        print("\n[VIS] Generating Resource Density (KDE Heatmap)...")
-
-        # Hard cap on KDE grid size — these are overview figures only
-        MAX_GRID_CELLS = 256
-
-        density, extent_world = self.analyzer._get_density_map(
-            bandwidth_m=bandwidth_m,
-            output_shape=(MAX_GRID_CELLS, MAX_GRID_CELLS),
-        )
-
-        min_x, max_x, min_y, max_y = extent_world
-        img_extent_mpl = [min_x, max_x, max_y, min_y]   # imshow origin='upper': [left, right, bottom, top] where bottom>top (Y inverted)
-
-        vmax_d = float(np.nanpercentile(density, 99)) if density.size > 0 else 1.0
-        if vmax_d == 0:
-            vmax_d = 1.0
-        norm_d = Normalize(vmin=0, vmax=vmax_d)
-        cmap_d = plt.cm.magma
-
-        # Contour levels in objects/m²
-        contour_levels = [lv for lv in [5, 10, 15] if lv < vmax_d]
-
-        # Centroids for clean-mode dot overlay
+        # Load polygons for the overlay
         polygons = self.analyzer._load_polygons()
-        centroids_m = np.array([[p.centroid.x, p.centroid.y] for p in polygons]) if polygons else np.zeros((0, 2))
-
-        # Summary stats
-        avg_density = float(np.nanmean(density))
-        max_density = float(np.nanmax(density))
-        survey_area_m2 = (max_x - min_x) * (max_y - min_y)
-
-        # Register external colorbar legend
-        self._legend_specs['resource_density'] = {
-            'cmap': cmap_d,
-            'norm': norm_d,
-            'label': 'Objects per m²',
-            'orientation': 'vertical',
-        }
-
-        def plot_density(ax: plt.Axes, mode: str) -> None:
-            ax.imshow(
-                density,
-                cmap=cmap_d,
-                norm=norm_d,
-                origin='upper',
-                extent=img_extent_mpl,
-                aspect='auto',
-                alpha=0.55 if mode == 'overlay' else 0.95,
-                interpolation='bilinear',
-                zorder=2,
-            )
-
-            # Ensure 1:1 aspect so X and Y meters scale equally (prevents squished figures)
-            ax.set_aspect('equal', adjustable='box')
-
-            # Contour lines
-            if len(contour_levels) > 0:
-                # Build a meshgrid matching density orientation
-                xs = np.linspace(min_x, max_x, density.shape[1])
-                ys = np.linspace(min_y, max_y, density.shape[0])
-                XX, YY = np.meshgrid(xs, ys)
-                # density is stored origin='upper' (row 0 = max_y), flip for contour alignment
-                ax.contour(
-                    XX, YY, density,
-                    levels=contour_levels,
-                    colors='white',
-                    linewidths=0.6,
-                    alpha=0.55,
-                    zorder=3,
-                )
-
-            # Raw centroid dots in clean mode
-            if mode == 'clean' and centroids_m.shape[0] > 0:
-                ax.scatter(
-                    centroids_m[:, 0], centroids_m[:, 1],
-                    s=1, c='white', alpha=0.35, linewidths=0, zorder=4,
-                )
-
-            ax.set_title(
-                f'Resource Density (KDE, bw={bandwidth_m} m)  '
-                f'avg={avg_density:.2f} obj/m²',
-                fontsize=9,
-            )
-
-        output_paths = self._render_and_save_low_res('resource_density', plot_density)
-
-        # ---- External density legend figure ----
-        try:
-            fig = plt.figure(figsize=(3.5, 5), dpi=96)
-            fig.patch.set_facecolor('#0D1117')
-
-            # Colorbar
-            cax = fig.add_axes([0.30, 0.38, 0.18, 0.52])
-            sm = ScalarMappable(cmap=cmap_d, norm=norm_d)
-            sm.set_array([])
-            cb = fig.colorbar(sm, cax=cax, orientation='vertical')
-            cb.set_label('Objects per m²', fontsize=8, color='#C9D1D9')
-            cb.ax.yaxis.set_tick_params(labelsize=7, colors='#8B949E')
-            cb.outline.set_edgecolor('#30363D')
-
-            # Stats table
-            ax_tbl = fig.add_axes([0.05, 0.04, 0.90, 0.30])
-            ax_tbl.set_facecolor('#161B22')
-            ax_tbl.axis('off')
-            table_data = [
-                ['Avg Density', f'{avg_density:.3f} obj/m²'],
-                ['Max Density', f'{max_density:.3f} obj/m²'],
-                ['Survey Area', f'{survey_area_m2:.2f} m²'],
-                ['N objects', str(len(polygons))],
-            ]
-            tbl = ax_tbl.table(
-                cellText=table_data,
-                colWidths=[0.50, 0.50],
-                cellLoc='left',
-                loc='center',
-            )
-            tbl.auto_set_font_size(False)
-            tbl.set_fontsize(8)
-            for (r, c), cell in tbl.get_celld().items():
-                cell.set_facecolor('#161B22')
-                cell.set_edgecolor('#30363D')
-                cell.set_text_props(color='#C9D1D9')
-
-            density_legend_path = self.output_dir / 'density_legend.png'
-            plt.savefig(density_legend_path, dpi=96, bbox_inches='tight')
-            plt.close(fig)
-            output_paths['density_legend'] = str(density_legend_path)
-            print(f"  ✓ Saved: {density_legend_path.name}")
-        except Exception as e:
-            print(f"[WARNING] Failed to save density_legend.png: {e}")
-
-        return output_paths
+        meters_per_px = self.analyzer.meters_per_pixel
+        
+        def plot_homogeneity(ax: plt.Axes, mode: str) -> None:
+            alpha_hm = 0.65 if mode == 'overlay' else 0.95
+            
+            # Plot the clean heatmap background
+            ax.imshow(grid_percentage, cmap=cmap, norm=norm, origin='upper',
+                      extent=extent, aspect='equal', alpha=alpha_hm, interpolation='nearest', zorder=2)
+            
+            # Draw all polygon outlines on top
+            for poly in polygons:
+                try:
+                    coords_m = np.array(poly.exterior.coords) * meters_per_px
+                    # Thin, semi-transparent white outline so it doesn't overpower the heatmap
+                    patch = mpatches.Polygon(coords_m, fill=False, edgecolor='white', 
+                                             linewidth=0.6, alpha=0.7, zorder=3)
+                    ax.add_patch(patch)
+                except Exception:
+                    continue
+                
+            ax.set_title(f"Class {target_class} Coverage Homogeneity & Polygons\nVMR = {vmr:.2f} [{pattern}]", 
+                         fontsize=11, fontweight='bold')
+                         
+        # Use low-res pipeline to prevent RAM crashes on the overlay
+        return self._render_and_save_low_res('spatial_homogeneity', plot_homogeneity)
 
     def visualize_bivariate_ripleys_k(self, class_a: str = 'nodule', class_b: str = 'organism',
                                       halo_radii_m: Tuple[float, float, float] = (0.25, 0.50, 1.0)) -> Dict[str, str]:
@@ -2249,6 +2112,290 @@ class SpatialMetricsVisualizer:
     def save_insets(self) -> Dict[str, str]:
         """Public wrapper to generate and save recorded inset images."""
         return self._save_insets()
+    
+    # ============================================================================
+    # BIOLOGICAL LOSS SUITE
+    # ============================================================================
+
+    def _generate_simulated_paths(self, width_m: float = 1.0) -> Dict[str, Dict[str, Any]]:
+        """
+        Generates 4 dynamic vehicle tracks. 
+        Uses a Dynamic Programming algorithm to find the optimal path, augmented 
+        with a "rubber band" penalty to return to the center, and Cubic Splines 
+        for smooth, realistic driving curves.
+        """
+        from shapely.geometry import LineString
+        import numpy as np
+        from scipy.interpolate import CubicSpline
+        
+        x_min, x_max, y_min, y_max = self._get_axis_limits()
+        mask = self.analyzer._load_mask()
+        
+        paths = {}
+        x_center = (x_min + x_max) / 2.0
+        
+        # 1. Baseline: Straight down the middle
+        center_line = LineString([(x_center, y_min - 2.0), (x_center, y_max + 2.0)])
+        paths['center_cut'] = {
+            # join_style=1 (round) creates smooth buffered edges around the curves
+            'polygon': center_line.buffer(width_m / 2.0, cap_style=2, join_style=1),
+            'centerline': center_line
+        }
+        
+        if mask is None:
+            return paths
+            
+        mpp = self.analyzer.meters_per_pixel
+        width_px = max(1, int(width_m / mpp))
+        h, w = mask.shape
+        
+        num_steps = 20  
+        step_h = max(1, h // num_steps)
+        
+        stride_x = max(1, int(0.1 / mpp))  
+        x_nodes = np.arange(width_px // 2, w - width_px // 2, stride_x)
+        if len(x_nodes) == 0: x_nodes = np.array([w // 2])
+        nx = len(x_nodes)
+        
+        max_steer_px = int(0.5 / mpp)
+        max_steer_nodes = max(1, max_steer_px // stride_x)
+        
+        # Calculate the "Rubber Band" centering penalty
+        # Costs the equivalent of 0.5 nodules per meter of drift from the centerline
+        dist_from_center_m = np.abs(x_nodes - (w // 2)) * mpp
+        pull_penalty = dist_from_center_m * 0.5
+        
+        dp_profit, dp_terrain, dp_eco = np.zeros(nx), np.zeros(nx), np.zeros(nx)
+        hist_profit = np.zeros((num_steps, nx), dtype=int)
+        hist_terrain = np.zeros((num_steps, nx), dtype=int)
+        hist_eco = np.zeros((num_steps, nx), dtype=int)
+        
+        kernel = np.ones(width_px)
+        
+        for step in range(num_steps):
+            y_start = step * step_h
+            y_end = (step + 1) * step_h if step < num_steps - 1 else h
+            
+            strip_N = np.sum(mask[y_start:y_end, :] == 2, axis=0) 
+            strip_H = np.sum((mask[y_start:y_end, :] == 3) | (mask[y_start:y_end, :] == 4), axis=0) 
+            
+            N_scores_full = np.convolve(strip_N, kernel, mode='same')
+            H_scores_full = np.convolve(strip_H, kernel, mode='same')
+            
+            # Apply the scores MINUS the centering penalty so the vehicle wants to return to the middle
+            s_profit = N_scores_full[x_nodes] - pull_penalty
+            s_terrain = (N_scores_full[x_nodes] * 0.001) - (H_scores_full[x_nodes] * 1000.0) - pull_penalty
+            s_eco = N_scores_full[x_nodes] - (H_scores_full[x_nodes] * 10.0) - pull_penalty
+            
+            if step == 0:
+                dp_profit, dp_terrain, dp_eco = s_profit, s_terrain, s_eco
+            else:
+                new_dp_p, new_dp_t, new_dp_e = np.full(nx, -np.inf), np.full(nx, -np.inf), np.full(nx, -np.inf)
+                
+                for i in range(nx):
+                    start_idx = max(0, i - max_steer_nodes)
+                    end_idx = min(nx, i + max_steer_nodes + 1)
+                    
+                    best_p = np.argmax(dp_profit[start_idx:end_idx])
+                    new_dp_p[i] = s_profit[i] + dp_profit[start_idx:end_idx][best_p]
+                    hist_profit[step, i] = start_idx + best_p
+                    
+                    best_t = np.argmax(dp_terrain[start_idx:end_idx])
+                    new_dp_t[i] = s_terrain[i] + dp_terrain[start_idx:end_idx][best_t]
+                    hist_terrain[step, i] = start_idx + best_t
+                    
+                    best_e = np.argmax(dp_eco[start_idx:end_idx])
+                    new_dp_e[i] = s_eco[i] + dp_eco[start_idx:end_idx][best_e]
+                    hist_eco[step, i] = start_idx + best_e
+                    
+                dp_profit, dp_terrain, dp_eco = new_dp_p, new_dp_t, new_dp_e
+                
+        # Backtrack
+        curr_p, curr_t, curr_e = np.argmax(dp_profit), np.argmax(dp_terrain), np.argmax(dp_eco)
+        pts_p, pts_t, pts_e = [], [], []
+        
+        for step in range(num_steps - 1, -1, -1):
+            y_start = step * step_h
+            y_end = (step + 1) * step_h if step < num_steps - 1 else h
+            y_mid_m = y_min + ((y_start + y_end) / 2.0) * mpp
+            
+            if step == 0: y_mid_m = y_min
+            if step == num_steps - 1: y_mid_m = y_max
+            
+            pts_p.append((x_nodes[curr_p] * mpp, y_mid_m))
+            pts_t.append((x_nodes[curr_t] * mpp, y_mid_m))
+            pts_e.append((x_nodes[curr_e] * mpp, y_mid_m))
+            
+            if step > 0:
+                curr_p = hist_profit[step, curr_p]
+                curr_t = hist_terrain[step, curr_t]
+                curr_e = hist_eco[step, curr_e]
+                
+        pts_p.reverse()
+        pts_t.reverse()
+        pts_e.reverse()
+        
+        strategies = {
+            'profit_maximizer': pts_p,
+            'terrain_aware': pts_t,
+            'eco_optimized': pts_e
+        }
+        
+        # Helper function to generate smooth curves from the zigzag waypoints
+        def smooth_waypoints(pts):
+            pts_arr = np.array(pts)
+            x_vals = pts_arr[:, 0]
+            y_vals = pts_arr[:, 1]
+            
+            # Fit a cubic spline (X as a function of Y, since Y is strictly increasing down the image)
+            cs = CubicSpline(y_vals, x_vals)
+            
+            # Generate 100 high-resolution points along the curve
+            y_smooth = np.linspace(y_vals[0], y_vals[-1], 100)
+            x_smooth = cs(y_smooth)
+            
+            return list(zip(x_smooth, y_smooth))
+        
+        for key, pts in strategies.items():
+            # 1. Extend off-screen
+            extended_pts = [(pts[0][0], y_min - 2.0)] + pts + [(pts[-1][0], y_max + 2.0)]
+            
+            # 2. Smooth the path into a sweeping curve
+            curved_pts = smooth_waypoints(extended_pts)
+            
+            track_line = LineString(curved_pts)
+            paths[key] = {
+                'polygon': track_line.buffer(width_m / 2.0, cap_style=2, join_style=1),
+                'centerline': track_line
+            }
+            
+        return paths
+
+    def _plot_biological_loss_chart(self, direct_counts: Dict[str, int], indirect_counts: Dict[str, int], output_path: str, title: str) -> None:
+        """Generates a standalone stacked bar chart for biological casualties."""
+        from matplotlib.ticker import MaxNLocator
+        
+        # Filter out resource classes to strictly show biological loss
+        bio_classes = [c for c in direct_counts.keys() if 'nodule' not in c.lower() and 'rock' not in c.lower()]
+        
+        if not bio_classes:
+            return 
+            
+        classes = sorted(bio_classes)
+        direct_vals = [direct_counts[c] for c in classes]
+        indirect_vals = [indirect_counts[c] for c in classes]
+        
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=self.figure_dpi)
+        fig.patch.set_facecolor('#0D1117')
+        ax.set_facecolor('#161B22')
+        
+        # Create stacked bars
+        x_pos = np.arange(len(classes))
+        ax.bar(x_pos, direct_vals, color='#FF4B4B', label='Direct (Killed)', edgecolor='#0D1117')
+        ax.bar(x_pos, indirect_vals, bottom=direct_vals, color='#FFA500', label='Indirect (Buffer)', edgecolor='#0D1117')
+        
+        # Styling
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([c.capitalize() for c in classes], color='#C9D1D9', rotation=45, ha='right')
+        ax.tick_params(colors='#8B949E')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#30363D')
+            
+        # FORCE INTEGER Y-AXIS
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+            
+        ax.set_ylabel('Number of Organisms Impacted', color='#C9D1D9', fontweight='bold')
+        ax.set_title(title, color='#C9D1D9', fontweight='bold', pad=15)
+        ax.legend(facecolor='#161B22', edgecolor='#30363D', labelcolor='#C9D1D9')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=self.figure_dpi, bbox_inches='tight')
+        plt.close(fig)
+
+    def visualize_projected_biological_loss(self, buffer_distance_m: float = 0.5, corridor_width_m: float = 1.0) -> Dict[str, Dict[str, str]]:
+        """
+        Simulates 4 different mining pathfinding strategies and generates a spatial 
+        map and stacked bar chart for each, visualizing ecological trade-offs.
+        """
+        print(f"\n[VIS] Generating Projected Biological Loss Simulations (Vehicle: {corridor_width_m}m, Buffer: {buffer_distance_m}m)...")
+        
+        paths_data = self._generate_simulated_paths(width_m=corridor_width_m)
+        polygons_by_class = self.analyzer._load_polygons_with_classes()
+        meters_per_px = self.analyzer.meters_per_pixel
+        
+        all_results = {}
+        
+        for path_name, path_dict in paths_data.items():
+            print(f"  → Simulating path: {path_name}")
+            
+            mining_polygon = path_dict['polygon']
+            centerline = path_dict['centerline']
+            buffer_zone = mining_polygon.buffer(buffer_distance_m)
+            
+            # Recalculate accurate counts using .intersects() to catch clipping
+            direct_counts = {c: 0 for c in polygons_by_class.keys()}
+            indirect_counts = {c: 0 for c in polygons_by_class.keys()}
+            
+            for class_name, poly_list in polygons_by_class.items():
+                for poly in poly_list:
+                    if poly.intersects(mining_polygon):
+                        direct_counts[class_name] += 1
+                    elif poly.intersects(buffer_zone):
+                        indirect_counts[class_name] += 1
+            
+            def plot_loss(ax: plt.Axes, mode: str) -> None:
+                # 1. Hazard Buffer
+                try:
+                    buf_coords = np.array(buffer_zone.exterior.coords)
+                    ax.add_patch(mpatches.Polygon(buf_coords, fill=True, facecolor='#FFA500', 
+                                                  edgecolor='none', alpha=0.15, zorder=1))
+                except Exception: pass
+                
+                # 2. Mining Footprint & Centerline
+                try:
+                    mine_coords = np.array(mining_polygon.exterior.coords)
+                    ax.add_patch(mpatches.Polygon(mine_coords, fill=True, facecolor='#FF4B4B', 
+                                                  edgecolor='none', alpha=0.25, zorder=2))
+                    ax.plot(mine_coords[:, 0], mine_coords[:, 1], color='#FF4B4B', 
+                            linewidth=2.0, linestyle='--', zorder=3)
+                            
+                    line_coords = np.array(centerline.coords)
+                    ax.plot(line_coords[:, 0], line_coords[:, 1], color='#FF4B4B', 
+                            linewidth=1.0, linestyle='-.', alpha=0.8, zorder=3)
+                except Exception: pass
+                
+                # 3. Draw classified polygons (Green = Resource, Red = Hazard)
+                for class_name, poly_list in polygons_by_class.items():
+                    is_resource = 'nodule' in class_name.lower() or 'rock' in class_name.lower()
+                    
+                    for poly in poly_list:
+                        try:
+                            # Static coloring based on object type
+                            if is_resource:
+                                color = '#3DDC84' # Green (Target)
+                            else:
+                                color = '#FF4B4B' # Red (Hazard: Organism/Obstruction)
+                                
+                            coords_m = np.array(poly.exterior.coords) * meters_per_px
+                            patch = mpatches.Polygon(coords_m, fill=True, facecolor=(*matplotlib.colors.to_rgb(color), 0.4), 
+                                                     edgecolor=color, linewidth=1.2, zorder=4)
+                            ax.add_patch(patch)
+                        except Exception: continue
+                
+                ax.set_title(f"Biological Loss Simulation: {path_name.replace('_', ' ').title()}\nTrack: {corridor_width_m}m | Buffer: {buffer_distance_m}m", fontsize=11, fontweight='bold')
+
+            map_paths = self._render_and_save(f'biological_loss_{path_name}', plot_loss)
+            
+            chart_path = str(self.output_dir / f"biological_loss_{path_name}_chart.png")
+            # Pass our custom, accurately calculated dictionaries directly to the chart plotter
+            self._plot_biological_loss_chart(direct_counts, indirect_counts, chart_path, f"Impacts: {path_name.replace('_', ' ').title()}")
+            map_paths['chart'] = chart_path
+            
+            all_results[path_name] = map_paths
+            
+        return all_results
+
+
 
 
 # =============================================================================
@@ -2343,17 +2490,11 @@ def visualize_all_metrics(
     #     print(f"[ERROR] Passability visualization failed: {e}")
     #     results['passability_index'] = None
 
-    try:
-        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    except Exception as e:
-        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-        results['spatial_homogeneity'] = None
-
-    try:
-        results['resource_density'] = viz.visualize_resource_density(bandwidth_m=0.5)
-    except Exception as e:
-        print(f"[ERROR] Resource density visualization failed: {e}")
-        results['resource_density'] = None
+    # try:
+    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    # except Exception as e:
+    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+    #     results['spatial_homogeneity'] = None
     
     # try:
     #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
@@ -2386,6 +2527,12 @@ def visualize_all_metrics(
     # except Exception as e:
     #     print(f"[ERROR] Embedment Angle visualization failed: {e}")
     #     results['embedment_angle'] = None
+
+    try:
+        results['projected_biological_loss'] = viz.visualize_projected_biological_loss()
+    except Exception as e:
+        print(f"[ERROR] Biological loss visualization failed: {e}")
+        results['projected_biological_loss'] = None
     
     print("\n" + "="*60)
     print("VISUALIZATION GENERATION COMPLETE")
