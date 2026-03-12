@@ -522,8 +522,8 @@ class SpatialMetricsVisualizer:
         self,
         metric_name: str,
         plot_func: Callable[[plt.Axes, str], None],
-        dpi: int = 96,
-        figsize: Tuple[int, int] = (6, 5),
+        dpi: Optional[int] = None,
+        figsize: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """
         Low-memory rendering engine for coarse grid-cell overview figures.
@@ -545,6 +545,10 @@ class SpatialMetricsVisualizer:
         Returns:
             Dict[str, str]: {'clean': ..., 'overlay': ..., 'combined': ...}
         """
+        # Default to the visualizer's high-resolution settings when not provided
+        dpi = dpi or self.figure_dpi
+        figsize = figsize or self.figure_size
+
         output_paths = {}
 
         # 1. STANDALONE CLEAN
@@ -1066,9 +1070,9 @@ class SpatialMetricsVisualizer:
 
         # 3. Combined Grid (Rows = Exemplars, Col1 = Clean, Col2 = Overlay)
         fig, axes = plt.subplots(len(self._exemplar_indices), 
-                                 2, 
-                                 figsize=(10, 4 * len(self._exemplar_indices)), 
-                                 dpi=self.figure_dpi)
+                     2, 
+                     figsize=(self.figure_size[0] * 2, self.figure_size[1] * len(self._exemplar_indices)), 
+                     dpi=self.figure_dpi)
         try:
             for row_idx, idx in enumerate(self._exemplar_indices):
                 draw_cell(axes[row_idx, 0], polygons[idx], morphology_df.iloc[idx]['solidity'], 'clean')
@@ -1909,7 +1913,7 @@ class SpatialMetricsVisualizer:
 
         # ── Ripley's K curve ──────────────────────────────────────────────────
         try:
-            fig, ax = plt.subplots(1, 1, figsize=(6, 3.5), dpi=self.figure_dpi)
+            fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
             try:
                 ax.plot(radii, observed, color='#3DDC84', linewidth=2.0, label='Observed')
                 ax.plot(radii, expected, color='#FF6B6B', linestyle='--', linewidth=1.6,
@@ -1938,7 +1942,7 @@ class SpatialMetricsVisualizer:
 
         # ── Interpretive legend ───────────────────────────────────────────────
         try:
-            fig = plt.figure(figsize=(4.5, 4), dpi=self.figure_dpi)
+            fig = plt.figure(figsize=self.figure_size, dpi=self.figure_dpi)
             try:
                 ax = fig.add_subplot(111)
                 ax.axis('off')
@@ -2044,7 +2048,7 @@ class SpatialMetricsVisualizer:
                 norm = spec.get('norm', None)
 
                 n_bins = min(30, max(10, len(values) // 5))
-                fig, ax = plt.subplots(1, 1, figsize=(4, 2), dpi=self.figure_dpi)
+                fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
                 ax.set_facecolor('#161B22')
                 ax.patch.set_alpha(0.85)
                 counts, bin_edges = np.histogram(values, bins=n_bins)
@@ -2077,7 +2081,7 @@ class SpatialMetricsVisualizer:
             elif itype == 'rose':
                 angles = np.asarray(spec.get('angles_deg', []))
                 n_bins = int(spec.get('n_bins', 24))
-                fig = plt.figure(figsize=(3, 3), dpi=self.figure_dpi)
+                fig = plt.figure(figsize=self.figure_size, dpi=self.figure_dpi)
                 ax = fig.add_subplot(111, projection='polar')
                 ax.set_facecolor('#161B22')
                 ax.patch.set_alpha(0.85)
@@ -2285,7 +2289,7 @@ class SpatialMetricsVisualizer:
         direct_vals = [direct_counts[c] for c in classes]
         indirect_vals = [indirect_counts[c] for c in classes]
         
-        fig, ax = plt.subplots(figsize=(6, 5), dpi=self.figure_dpi)
+        fig, ax = plt.subplots(figsize=self.figure_size, dpi=self.figure_dpi)
         fig.patch.set_facecolor('#0D1117')
         ax.set_facecolor('#161B22')
         
@@ -2478,42 +2482,42 @@ def visualize_all_metrics(
     print("GENERATING ALL METRIC VISUALIZATIONS")
     print("="*60 + "\n")
     
-    # try:
-    #     results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
-    # except Exception as e:
-    #     print(f"[ERROR] NND visualization failed: {e}")
-    #     results['nearest_neighbor_distance'] = None
+    try:
+        results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
+    except Exception as e:
+        print(f"[ERROR] NND visualization failed: {e}")
+        results['nearest_neighbor_distance'] = None
     
-    # try:
-    #     results['passability_index'] = viz.visualize_passability_index()
-    # except Exception as e:
-    #     print(f"[ERROR] Passability visualization failed: {e}")
-    #     results['passability_index'] = None
+    try:
+        results['passability_index'] = viz.visualize_passability_index()
+    except Exception as e:
+        print(f"[ERROR] Passability visualization failed: {e}")
+        results['passability_index'] = None
 
-    # try:
-    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    # except Exception as e:
-    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-    #     results['spatial_homogeneity'] = None
+    try:
+        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    except Exception as e:
+        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+        results['spatial_homogeneity'] = None
     
-    # try:
-    #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
-    # except Exception as e:
-    #     print(f"[ERROR] Solidity visualization failed: {e}")
-    #     results['solidity_rugosity'] = None
+    try:
+        results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
+    except Exception as e:
+        print(f"[ERROR] Solidity visualization failed: {e}")
+        results['solidity_rugosity'] = None
     
-    # try:
-    #     results['obb_directionality'] = viz.visualize_obb_directionality()
-    # except Exception as e:
-    #     print(f"[ERROR] OBB visualization failed: {e}")
-    #     results['obb_directionality'] = None
+    try:
+        results['obb_directionality'] = viz.visualize_obb_directionality()
+    except Exception as e:
+        print(f"[ERROR] OBB visualization failed: {e}")
+        results['obb_directionality'] = None
 
-    # # Bivariate Ripley's K (Invisible Halo)
-    # try:
-    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    # except Exception as e:
-    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-    #     results['bivariate_ripleys_k'] = None
+    # Bivariate Ripley's K (Invisible Halo)
+    try:
+        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    except Exception as e:
+        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+        results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     # try:

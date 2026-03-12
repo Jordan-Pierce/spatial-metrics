@@ -641,7 +641,7 @@ class SpatialMetricsAnalyzer:
         
         return results
     
-    def calculate_spatial_homogeneity(self, grid_size: int = 4) -> Dict[str, float]:
+    def calculate_spatial_homogeneity(self, grid_size: int = 16) -> Dict[str, float]:
         """
         Calculate Spatial Homogeneity via Quadrat Analysis - The Patchiness Metric.
         
