@@ -483,7 +483,17 @@ class SpatialMetricsVisualizer:
         fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
         try:
             self._prepare_axis_clean(ax)
-            plot_func(ax, 'clean')
+            ret_clean = plot_func(ax, 'clean')
+            # Allow plot_func to return a subtitle string or a dict with per-mode subtitles
+            subtitle_clean = None
+            if isinstance(ret_clean, dict):
+                subtitle_clean = ret_clean.get('clean') or ret_clean.get('subtitle')
+            elif isinstance(ret_clean, str):
+                subtitle_clean = ret_clean
+
+            if subtitle_clean:
+                ax.set_title(f"{metric_name} (Clean)\n{subtitle_clean}", fontsize=12)
+
             clean_path = self.output_dir / f"{metric_name}_clean.png"
             plt.savefig(clean_path, dpi=self.figure_dpi, bbox_inches='tight')
             output_paths['clean'] = str(clean_path)
@@ -494,7 +504,16 @@ class SpatialMetricsVisualizer:
         fig, ax = plt.subplots(1, 1, figsize=self.figure_size, dpi=self.figure_dpi)
         try:
             self._prepare_axis_overlay(ax)
-            plot_func(ax, 'overlay')
+            ret_overlay = plot_func(ax, 'overlay')
+            subtitle_overlay = None
+            if isinstance(ret_overlay, dict):
+                subtitle_overlay = ret_overlay.get('overlay') or ret_overlay.get('subtitle')
+            elif isinstance(ret_overlay, str):
+                subtitle_overlay = ret_overlay
+
+            if subtitle_overlay:
+                ax.set_title(f"{metric_name} (Overlay)\n{subtitle_overlay}", fontsize=12)
+
             overlay_path = self.output_dir / f"{metric_name}_overlay.png"
             plt.savefig(overlay_path, dpi=self.figure_dpi, bbox_inches='tight')
             output_paths['overlay'] = str(overlay_path)
@@ -505,11 +524,29 @@ class SpatialMetricsVisualizer:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(self.figure_size[0]*2, self.figure_size[1]), dpi=self.figure_dpi)
         try:
             self._prepare_axis_clean(ax1)
-            plot_func(ax1, 'clean')
-            ax1.set_title(f'{metric_name} (Clean)', fontsize=14, fontweight='bold')
+            ret1 = plot_func(ax1, 'clean')
+            subtitle1 = None
+            if isinstance(ret1, dict):
+                subtitle1 = ret1.get('clean') or ret1.get('subtitle')
+            elif isinstance(ret1, str):
+                subtitle1 = ret1
+            title1 = f'{metric_name} (Clean)'
+            if subtitle1:
+                title1 = f"{title1}\n{subtitle1}"
+            ax1.set_title(title1, fontsize=14, fontweight='bold')
+
             self._prepare_axis_overlay(ax2)
-            plot_func(ax2, 'overlay')
-            ax2.set_title(f'{metric_name} (Overlay)', fontsize=14, fontweight='bold')
+            ret2 = plot_func(ax2, 'overlay')
+            subtitle2 = None
+            if isinstance(ret2, dict):
+                subtitle2 = ret2.get('overlay') or ret2.get('subtitle')
+            elif isinstance(ret2, str):
+                subtitle2 = ret2
+            title2 = f'{metric_name} (Overlay)'
+            if subtitle2:
+                title2 = f"{title2}\n{subtitle2}"
+            ax2.set_title(title2, fontsize=14, fontweight='bold')
+
             combined_path = self.output_dir / f"{metric_name}_combined.png"
             plt.savefig(combined_path, dpi=self.figure_dpi, bbox_inches='tight')
             output_paths['combined'] = str(combined_path)
@@ -722,7 +759,7 @@ class SpatialMetricsVisualizer:
             'label': 'Gap to nearest neighbour (m)',
             'orientation': 'vertical'
         }
-        def plot_nnd(ax: plt.Axes, mode: str) -> None:
+        def plot_nnd(ax: plt.Axes, mode: str) -> str:
             """Render NND: polygons coloured by gap score + connector lines + inset histogram."""
             polygons = self.analyzer._load_polygons()
 
@@ -775,6 +812,12 @@ class SpatialMetricsVisualizer:
                     'cmap': nnd_cmap,
                     'norm': nnd_norm
                 }
+            
+            # Return subtitle with statistics
+            mean_nnd = float(np.nanmean(nnd_values_m)) if len(nnd_values_m) > 0 else 0.0
+            max_nnd = float(np.nanmax(nnd_values_m)) if len(nnd_values_m) > 0 else 0.0
+            n_at_risk = int(np.sum(nnd_values_m < distance_threshold_m)) if len(nnd_values_m) > 0 else 0
+            return f"Mean: {mean_nnd:.3f}m  |  Max: {max_nnd:.3f}m  |  At-risk (<{distance_threshold_m}m): {n_at_risk}"
 
         return self._render_and_save('nearest_neighbor_distance', plot_nnd)
 
@@ -796,7 +839,7 @@ class SpatialMetricsVisualizer:
         """
         metric_results = self.analyzer.calculate_passability_index()
         
-        def plot_passability(ax: plt.Axes, mode: str) -> None:
+        def plot_passability(ax: plt.Axes, mode: str) -> str:
             """Render passability as traversability corridors with contour bands."""
             mask = self.analyzer._load_mask()
             
@@ -893,6 +936,12 @@ class SpatialMetricsVisualizer:
             except Exception:
                 # Best-effort; do not break rendering if normalization fails
                 pass
+            
+            # Return subtitle with statistics
+            free_space_pixels = int(np.sum(free_space_mask))
+            total_pixels = mask.size
+            free_pct = 100.0 * free_space_pixels / total_pixels if total_pixels > 0 else 0.0
+            return f"Max clearance: {max_r:.3f}m  |  Free space: {free_pct:.1f}%"
 
         return self._render_and_save('passability_index', plot_passability)
 
@@ -1152,7 +1201,7 @@ class SpatialMetricsVisualizer:
             print(f"[INFO] Auto-calculated stride={stride} for safe 3D rendering")
         
         # --- 2D PLOTTING LOGIC ---
-        def plot_protrusion_2d(ax: plt.Axes, mode: str) -> None:
+        def plot_protrusion_2d(ax: plt.Axes, mode: str) -> str:
             """
             Render 2D protrusion heatmap.
             
@@ -1195,9 +1244,18 @@ class SpatialMetricsVisualizer:
             }
             
             ax.set_title('Protrusion: Collector Clearance Map', fontsize=12, fontweight='bold')
+            
+            # Return subtitle with statistics
+            try:
+                mean_su = float(np.nanmean(stick_up_masked))
+                max_su = float(np.nanmax(stick_up_masked))
+                n_objects = int(np.sum(~np.isnan(stick_up_masked)))
+                return f"Mean: {mean_su:.3f}m  |  Max: {max_su:.3f}m  |  Objects: {n_objects}"
+            except Exception:
+                return ""
         
         # --- 3D PLOTTING LOGIC ---
-        def plot_protrusion_3d(ax: plt.Axes, mode: str) -> None:
+        def plot_protrusion_3d(ax: plt.Axes, mode: str) -> str:
             """
             Render 3D protrusion with stick-up-coloured terrain and wireframe seafloor plane.
             
@@ -1262,6 +1320,9 @@ class SpatialMetricsVisualizer:
                                depthshade=False, zorder=5)
 
             ax.set_title('3D Protrusion  ·  Virtual Seafloor Plane', color='#E6EDF3')
+            
+            # Return empty string for 3D (title contains info already)
+            return ""
         
         # Execute the Rule of Five rendering pipeline
         return self._render_and_save_3d_suite('protrusion', plot_protrusion_2d, plot_protrusion_3d)
@@ -1335,7 +1396,7 @@ class SpatialMetricsVisualizer:
         slope_degrees = np.degrees(slope_radians)
         
         # --- 2D PLOTTING LOGIC ---
-        def plot_embedment_2d(ax: plt.Axes, mode: str) -> None:
+        def plot_embedment_2d(ax: plt.Axes, mode: str) -> str:
             """
             Render 2D embedment angle as colored perimeter rings.
             
@@ -1365,9 +1426,18 @@ class SpatialMetricsVisualizer:
             }
             
             ax.set_title('Embedment Angle: Breakout Force Perimeter Rings', fontsize=12, fontweight='bold')
+            
+            # Return subtitle with statistics
+            try:
+                mean_angle = float(np.nanmean(perimeter_slopes))
+                max_angle = float(np.nanmax(perimeter_slopes))
+                n_perimeter = int(np.sum(~np.isnan(perimeter_slopes)))
+                return f"Mean: {mean_angle:.1f}°  |  Max: {max_angle:.1f}°  |  Perimeter pixels: {n_perimeter}"
+            except Exception:
+                return ""
         
         # --- 3D PLOTTING LOGIC ---
-        def plot_embedment_3d(ax: plt.Axes, mode: str) -> None:
+        def plot_embedment_3d(ax: plt.Axes, mode: str) -> str:
             """
             Render 3D embedment angle visualization.
             
@@ -1452,6 +1522,9 @@ class SpatialMetricsVisualizer:
                 }
             
             ax.set_title('3D Embedment Angle', fontsize=12, fontweight='bold')
+            
+            # Return empty string for 3D (title contains info already)
+            return ""
         
         # Execute the Rule of Five rendering pipeline
         return self._render_and_save_3d_suite('embedment_angle', plot_embedment_2d, plot_embedment_3d)
@@ -1505,7 +1578,7 @@ class SpatialMetricsVisualizer:
             'orientation': 'vertical'
         }
 
-        def plot_obb(ax: plt.Axes, mode: str) -> None:
+        def plot_obb(ax: plt.Axes, mode: str) -> str:
             """Render OBB: polygons + directional lines coloured by orientation."""
             polygons = self.analyzer._load_polygons()
             lines, line_colors = [], []
@@ -1628,6 +1701,14 @@ class SpatialMetricsVisualizer:
                     alpha=0.8
                 )
             )
+            
+            # Return subtitle with orientation statistics
+            try:
+                mean_angle = float(np.nanmean(angles_deg))
+                std_angle = float(np.nanstd(angles_deg))
+                return f"Mean orientation: {mean_angle:.1f}° ± {std_angle:.1f}°  |  N={len(angles_deg)}"
+            except Exception:
+                return ""
 
         return self._render_and_save('obb_directionality', plot_obb)
 
@@ -1688,7 +1769,7 @@ class SpatialMetricsVisualizer:
         polygons = self.analyzer._load_polygons()
         meters_per_px = self.analyzer.meters_per_pixel
         
-        def plot_homogeneity(ax: plt.Axes, mode: str) -> None:
+        def plot_homogeneity(ax: plt.Axes, mode: str) -> str:
             alpha_hm = 0.65 if mode == 'overlay' else 0.95
             
             # Plot the clean heatmap background
@@ -1708,6 +1789,9 @@ class SpatialMetricsVisualizer:
                 
             ax.set_title(f"Class {target_class} Coverage Homogeneity & Polygons\nVMR = {vmr:.2f} [{pattern}]", 
                          fontsize=11, fontweight='bold')
+            
+            # Return subtitle with statistics
+            return f"Mean coverage: {mean_cov:.1f}%  |  Variance: {variance:.2f}  |  Pattern: {pattern}"
                          
         # Use low-res pipeline to prevent RAM crashes on the overlay
         return self._render_and_save_low_res('spatial_homogeneity', plot_homogeneity)
@@ -1832,7 +1916,7 @@ class SpatialMetricsVisualizer:
             'orientation': 'vertical'
         }
 
-        def plot_bivariate(ax: plt.Axes, mode: str) -> None:
+        def plot_bivariate(ax: plt.Axes, mode: str) -> str:
             # ── 1. Halo rings + core glow (background, drawn first) ───────
             if centroids_b_m.shape[0] > 0:
                 for (bx, by) in centroids_b_m:
@@ -1907,6 +1991,11 @@ class SpatialMetricsVisualizer:
                 f'≤{r_inner}m: {n_inner}  ≤{r_mid}m: {n_mid}  ≤{r_outer}m: {n_outer}  safe: {n_safe}',
                 fontsize=8,
             )
+            
+            # Return subtitle with key statistics
+            total_nodules = len(class_a_polys)
+            percent_risk = 100.0 * (n_inner + n_mid) / total_nodules if total_nodules > 0 else 0.0
+            return f"At-risk (<{r_mid}m): {percent_risk:.1f}% ({n_inner + n_mid}/{total_nodules})  |  Safe: {n_safe}"
 
         # ── Render Rule-of-Three suite ────────────────────────────────────────
         output_paths = self._render_and_save('bivariate_ripleys_k', plot_bivariate)
@@ -2347,7 +2436,7 @@ class SpatialMetricsVisualizer:
                     elif poly.intersects(buffer_zone):
                         indirect_counts[class_name] += 1
             
-            def plot_loss(ax: plt.Axes, mode: str) -> None:
+            def plot_loss(ax: plt.Axes, mode: str) -> str:
                 # 1. Hazard Buffer
                 try:
                     buf_coords = np.array(buffer_zone.exterior.coords)
@@ -2387,6 +2476,11 @@ class SpatialMetricsVisualizer:
                         except Exception: continue
                 
                 ax.set_title(f"Biological Loss Simulation: {path_name.replace('_', ' ').title()}\nTrack: {corridor_width_m}m | Buffer: {buffer_distance_m}m", fontsize=11, fontweight='bold')
+                
+                # Return subtitle with impact statistics
+                total_direct = sum(direct_counts.values())
+                total_indirect = sum(indirect_counts.values())
+                return f"Direct impact: {total_direct}  |  Buffer impact: {total_indirect}  |  Total at-risk: {total_direct + total_indirect}"
 
             map_paths = self._render_and_save(f'biological_loss_{path_name}', plot_loss)
             
