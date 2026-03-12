@@ -842,33 +842,50 @@ class SpatialMetricsVisualizer:
         def plot_passability(ax: plt.Axes, mode: str) -> str:
             """Render passability as traversability corridors with contour bands."""
             mask = self.analyzer._load_mask()
-            
-            # Substrate (1) and Nodules (2) are free space for navigation
-            # Organisms (3) and Obstructions (4) are obstacles
-            free_space_mask = ((mask == 1) | (mask == 2)).astype(np.uint8)
-            
-            distance_transform = ndimage.distance_transform_edt(free_space_mask)
-            distance_transform_m = distance_transform * self.analyzer.meters_per_pixel
-
             height, width = mask.shape
+            
+            # Identify actual hazards (Organisms = 3, Obstructions = 4)
+            obstacles_mask = ((mask == 3) | (mask == 4))
+            
+            if not np.any(obstacles_mask):
+                # If there are no hazards, the entire area is infinitely passable.
+                # Fill with a uniform "safe" distance (e.g., the diagonal of the image)
+                diagonal_m = np.sqrt(height**2 + width**2) * self.analyzer.meters_per_pixel
+                distance_transform_m = np.full((height, width), diagonal_m)
+                max_r = diagonal_m
+                contour_levels = [] # No contours needed for a uniform safe field
+                passable_ratio = 1.0
+            else:
+                # Safe space is anything that is NOT a defined hazard.
+                # This prevents the image boundaries (background class 0) from acting as walls.
+                safe_space_mask = (~obstacles_mask).astype(np.uint8)
+                distance_transform = ndimage.distance_transform_edt(safe_space_mask)
+                distance_transform_m = distance_transform * self.analyzer.meters_per_pixel
+                max_r = float(distance_transform_m[~np.isnan(distance_transform_m)].max())
+                
+                # Contour levels at 10%, 25%, 50% of max radius = vehicle size thresholds
+                contour_levels = [max_r * f for f in (0.1, 0.2, 0.3) if max_r * f > 0]
+                
+                # Calculate passability as percentage of space with positive clearance
+                passable_pixels = np.sum((distance_transform_m > 0) & ~np.isnan(distance_transform_m))
+                total_pixels = height * width
+                passable_ratio = passable_pixels / total_pixels if total_pixels > 0 else 0.0
+
             extent = [0, width * self.analyzer.meters_per_pixel,
                       height * self.analyzer.meters_per_pixel, 0]
 
             # --- Background heatmap ---
             alpha = 1.0 if mode == 'clean' else 0.50
+            # By setting vmin=0 and vmax=max_r, a field with no obstacles will render 
+            # as a uniform solid color (the safest/brightest color in magma_r)
             im = ax.imshow(distance_transform_m, cmap='magma_r',
-                           origin='upper', extent=extent, alpha=alpha)
+                           origin='upper', extent=extent, alpha=alpha, 
+                           vmin=0.0, vmax=max_r if max_r > 0 else 1.0)
 
             # --- Traversability contour bands ---
-            # Build a pixel-space meshgrid for contour plotting
-            h, w = distance_transform_m.shape
-            xs = np.linspace(0, w * self.analyzer.meters_per_pixel, w)
-            ys = np.linspace(0, h * self.analyzer.meters_per_pixel, h)
-            max_r = float(distance_transform_m[~np.isnan(distance_transform_m)].max())
-            
-            # Contour levels at 25 %, 50 %, 75 % of max radius = vehicle size thresholds
-            contour_levels = [max_r * f for f in (0.1, 0.25, 0.50) if max_r * f > 0]
             if contour_levels:
+                xs = np.linspace(0, width * self.analyzer.meters_per_pixel, width)
+                ys = np.linspace(0, height * self.analyzer.meters_per_pixel, height)
                 cs = ax.contour(xs, ys, distance_transform_m,
                                 levels=contour_levels, origin='upper',
                                 colors=['#FF4B4B', '#FFD33D', '#3DDC84'],
@@ -876,8 +893,6 @@ class SpatialMetricsVisualizer:
                 contour_labels = [f'{v:.2f} m' for v in contour_levels]
                 fmt = {lvl: lbl for lvl, lbl in zip(cs.levels, contour_labels)}
                 ax.clabel(cs, fmt=fmt, fontsize=7, colors='white', inline=True, inline_spacing=4)
-
-                # (Maximum inscribed circle visualization removed)
 
             # --- Polygon overlays: draw annotated polygons on top of the heatmap ---
             try:
@@ -925,7 +940,6 @@ class SpatialMetricsVisualizer:
                 pass
 
             # Colourbar/legend should not be drawn inline — record a legend spec
-            # so a separate legend image can be saved later via _save_legends().
             try:
                 self._legend_specs['passability_index'] = {
                     'cmap': plt.cm.magma_r,
@@ -934,14 +948,10 @@ class SpatialMetricsVisualizer:
                     'orientation': 'vertical'
                 }
             except Exception:
-                # Best-effort; do not break rendering if normalization fails
                 pass
             
             # Return subtitle with statistics
-            free_space_pixels = int(np.sum(free_space_mask))
-            total_pixels = mask.size
-            free_pct = 100.0 * free_space_pixels / total_pixels if total_pixels > 0 else 0.0
-            return f"Max clearance: {max_r:.3f}m  |  Free space: {free_pct:.1f}%"
+            return f"Max clearance: {max_r:.3f}m  |  Passable space: {passable_ratio*100:.1f}%"
 
         return self._render_and_save('passability_index', plot_passability)
 
@@ -2576,11 +2586,11 @@ def visualize_all_metrics(
     print("GENERATING ALL METRIC VISUALIZATIONS")
     print("="*60 + "\n")
     
-    try:
-        results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
-    except Exception as e:
-        print(f"[ERROR] NND visualization failed: {e}")
-        results['nearest_neighbor_distance'] = None
+    # try:
+    #     results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
+    # except Exception as e:
+    #     print(f"[ERROR] NND visualization failed: {e}")
+    #     results['nearest_neighbor_distance'] = None
     
     try:
         results['passability_index'] = viz.visualize_passability_index()
@@ -2588,30 +2598,30 @@ def visualize_all_metrics(
         print(f"[ERROR] Passability visualization failed: {e}")
         results['passability_index'] = None
 
-    try:
-        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    except Exception as e:
-        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-        results['spatial_homogeneity'] = None
+    # try:
+    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    # except Exception as e:
+    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+    #     results['spatial_homogeneity'] = None
     
-    try:
-        results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
-    except Exception as e:
-        print(f"[ERROR] Solidity visualization failed: {e}")
-        results['solidity_rugosity'] = None
+    # try:
+    #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
+    # except Exception as e:
+    #     print(f"[ERROR] Solidity visualization failed: {e}")
+    #     results['solidity_rugosity'] = None
     
-    try:
-        results['obb_directionality'] = viz.visualize_obb_directionality()
-    except Exception as e:
-        print(f"[ERROR] OBB visualization failed: {e}")
-        results['obb_directionality'] = None
+    # try:
+    #     results['obb_directionality'] = viz.visualize_obb_directionality()
+    # except Exception as e:
+    #     print(f"[ERROR] OBB visualization failed: {e}")
+    #     results['obb_directionality'] = None
 
-    # Bivariate Ripley's K (Invisible Halo)
-    try:
-        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    except Exception as e:
-        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-        results['bivariate_ripleys_k'] = None
+    # # Bivariate Ripley's K (Invisible Halo)
+    # try:
+    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    # except Exception as e:
+    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+    #     results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
     # try:
@@ -2626,11 +2636,11 @@ def visualize_all_metrics(
     #     print(f"[ERROR] Embedment Angle visualization failed: {e}")
     #     results['embedment_angle'] = None
 
-    try:
-        results['projected_biological_loss'] = viz.visualize_projected_biological_loss()
-    except Exception as e:
-        print(f"[ERROR] Biological loss visualization failed: {e}")
-        results['projected_biological_loss'] = None
+    # try:
+    #     results['projected_biological_loss'] = viz.visualize_projected_biological_loss()
+    # except Exception as e:
+    #     print(f"[ERROR] Biological loss visualization failed: {e}")
+    #     results['projected_biological_loss'] = None
     
     print("\n" + "="*60)
     print("VISUALIZATION GENERATION COMPLETE")
