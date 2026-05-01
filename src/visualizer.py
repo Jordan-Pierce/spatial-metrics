@@ -2586,11 +2586,11 @@ def visualize_all_metrics(
     print("GENERATING ALL METRIC VISUALIZATIONS")
     print("="*60 + "\n")
     
-    # try:
-    #     results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
-    # except Exception as e:
-    #     print(f"[ERROR] NND visualization failed: {e}")
-    #     results['nearest_neighbor_distance'] = None
+    try:
+        results['nearest_neighbor_distance'] = viz.visualize_nearest_neighbor_distance()
+    except Exception as e:
+        print(f"[ERROR] NND visualization failed: {e}")
+        results['nearest_neighbor_distance'] = None
     
     try:
         results['passability_index'] = viz.visualize_passability_index()
@@ -2598,49 +2598,49 @@ def visualize_all_metrics(
         print(f"[ERROR] Passability visualization failed: {e}")
         results['passability_index'] = None
 
-    # try:
-    #     results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
-    # except Exception as e:
-    #     print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
-    #     results['spatial_homogeneity'] = None
+    try:
+        results['spatial_homogeneity'] = viz.visualize_spatial_homogeneity()
+    except Exception as e:
+        print(f"[ERROR] Spatial homogeneity visualization failed: {e}")
+        results['spatial_homogeneity'] = None
     
-    # try:
-    #     results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
-    # except Exception as e:
-    #     print(f"[ERROR] Solidity visualization failed: {e}")
-    #     results['solidity_rugosity'] = None
+    try:
+        results['solidity_rugosity'] = viz.visualize_solidity_rugosity()
+    except Exception as e:
+        print(f"[ERROR] Solidity visualization failed: {e}")
+        results['solidity_rugosity'] = None
     
-    # try:
-    #     results['obb_directionality'] = viz.visualize_obb_directionality()
-    # except Exception as e:
-    #     print(f"[ERROR] OBB visualization failed: {e}")
-    #     results['obb_directionality'] = None
+    try:
+        results['obb_directionality'] = viz.visualize_obb_directionality()
+    except Exception as e:
+        print(f"[ERROR] OBB visualization failed: {e}")
+        results['obb_directionality'] = None
 
-    # # Bivariate Ripley's K (Invisible Halo)
-    # try:
-    #     results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
-    # except Exception as e:
-    #     print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
-    #     results['bivariate_ripleys_k'] = None
+    # Bivariate Ripley's K (Invisible Halo)
+    try:
+        results['bivariate_ripleys_k'] = viz.visualize_bivariate_ripleys_k()
+    except Exception as e:
+        print(f"[ERROR] Bivariate Ripley's K visualization failed: {e}")
+        results['bivariate_ripleys_k'] = None
     
     # Phase 3: Verticality Metrics (3D - require elevation)
-    # try:
-    #     results['protrusion'] = viz.visualize_protrusion()
-    # except Exception as e:
-    #     print(f"[ERROR] Protrusion visualization failed: {e}")
-    #     results['protrusion'] = None
+    try:
+        results['protrusion'] = viz.visualize_protrusion()
+    except Exception as e:
+        print(f"[ERROR] Protrusion visualization failed: {e}")
+        results['protrusion'] = None
     
-    # try:
-    #     results['embedment_angle'] = viz.visualize_embedment_angle()
-    # except Exception as e:
-    #     print(f"[ERROR] Embedment Angle visualization failed: {e}")
-    #     results['embedment_angle'] = None
+    try:
+        results['embedment_angle'] = viz.visualize_embedment_angle()
+    except Exception as e:
+        print(f"[ERROR] Embedment Angle visualization failed: {e}")
+        results['embedment_angle'] = None
 
-    # try:
-    #     results['projected_biological_loss'] = viz.visualize_projected_biological_loss()
-    # except Exception as e:
-    #     print(f"[ERROR] Biological loss visualization failed: {e}")
-    #     results['projected_biological_loss'] = None
+    try:
+        results['projected_biological_loss'] = viz.visualize_projected_biological_loss()
+    except Exception as e:
+        print(f"[ERROR] Biological loss visualization failed: {e}")
+        results['projected_biological_loss'] = None
     
     print("\n" + "="*60)
     print("VISUALIZATION GENERATION COMPLETE")
